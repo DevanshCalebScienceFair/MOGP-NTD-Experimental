@@ -4,7 +4,7 @@ import gpytorch
 import numpy as np
 import torch
 
-from fingerprints import smiles_to_morgan
+from utils.featurize import smiles_to_morgan
 
 
 class TanimotoKernel(gpytorch.kernels.Kernel):
