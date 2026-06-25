@@ -6,32 +6,37 @@ existing pieces:
   * Morgan fingerprints (``utils/featurize.py``) as the molecular representation.
   * A Tanimoto similarity kernel (``kernel.py``) as the GP covariance over those
     fingerprints.
-  * A pretrained ADMET oracle (``train_admet_oracle.py`` -> ``models/pretrained_admet/``)
-    that supplies the regression/classification targets to learn.
+  * The ADMET oracle (``admet_oracle.ADMETOracle``) that supplies the
+    regression/classification targets to learn.
 
 The MOGP places one independent scaled-Tanimoto GP on each objective and packs
 them into a single ``MultitaskMultivariateNormal`` so predictions (mean and
 per-task uncertainty) come out together. Target columns are always handled in
-the fixed order ``[caco2, half_life, herg]``.
+the fixed order given by ``TASK_NAMES``:
+``[Caco2_Permeability, Half_Life, hERG_Toxicity_Prob, PfDHFR_Docking]``.
 
 Run ``python mogp.py`` for a self-contained demo on a handful of known drugs.
 """
 
-import os
-
 import gpytorch
-import joblib
 import numpy as np
 import torch
 
+from admet_oracle import ADMETOracle
 from utils.featurize import smiles_to_morgan, batch_smiles_to_morgan
 from kernel import TanimotoKernel
 
 
-# Directory holding the pretrained ADMET oracle models, and the fixed column
-# order every Y matrix / prediction in this module adheres to.
-ADMET_MODEL_DIR = os.path.join("models", "pretrained_admet")
-TASK_NAMES = ["caco2", "half_life", "herg"]
+# The fixed column order every Y matrix / prediction in this module adheres to.
+# This is the single source of truth for objective order everywhere in mogp.py
+# (train_mogp, predict, and the demo). The first three are produced by the ADMET
+# oracle; PfDHFR_Docking is a placeholder until the docking module is added.
+TASK_NAMES = [
+    "Caco2_Permeability",
+    "Half_Life",
+    "hERG_Toxicity_Prob",
+    "PfDHFR_Docking",
+]
 
 
 class MOGPModel(gpytorch.models.ExactGP):
@@ -74,46 +79,57 @@ class MOGPModel(gpytorch.models.ExactGP):
         )
 
 
-def load_admet_scores(smiles_list):
-    """Compute ADMET targets for a list of SMILES using the pretrained oracle.
+def get_training_data(smiles_list):
+    """Build the MOGP target matrix for a list of SMILES via the ADMET oracle.
 
-    Loads the three pretrained models from ``models/pretrained_admet/`` and runs
-    them on Morgan fingerprints of the input molecules. The half-life model is
-    stored in log10(hours); this function reverses that transform so the returned
-    value is in hours.
+    Runs ``ADMETOracle.predict`` and keeps only molecules that are in-domain and
+    have complete oracle predictions: rows flagged ``Out_of_Domain_Warning`` or
+    carrying any NaN oracle prediction are dropped.
 
     Args:
         smiles_list: Iterable of SMILES strings.
 
     Returns:
         A tuple ``(Y, valid_smiles)`` where ``Y`` is a numpy array of shape
-        ``(N_valid, 3)`` with columns ``[caco2, half_life, herg]`` and
-        ``valid_smiles`` is the list of SMILES that featurized successfully (in
-        input order).
-
-    Raises:
-        FileNotFoundError: If the pretrained model directory does not exist.
+        ``(N_valid, 4)``, float32, with columns in ``TASK_NAMES`` order
+        ``[Caco2_Permeability, Half_Life, hERG_Toxicity_Prob, PfDHFR_Docking]``.
+        The ``PfDHFR_Docking`` column is filled with NaN as a placeholder until
+        the docking module is added. ``valid_smiles`` is the list of SMILES that
+        passed the filter (in input order).
     """
-    if not os.path.isdir(ADMET_MODEL_DIR):
-        raise FileNotFoundError(
-            f"ADMET oracle models not found at '{ADMET_MODEL_DIR}'. "
-            "Run train_admet_oracle.py first to train and save them."
-        )
+    oracle = ADMETOracle()
+    df = oracle.predict(smiles_list)
 
-    caco2 = joblib.load(os.path.join(ADMET_MODEL_DIR, "caco2.joblib"))["model"]
-    half_life = joblib.load(os.path.join(ADMET_MODEL_DIR, "half_life.joblib"))["model"]
-    herg = joblib.load(os.path.join(ADMET_MODEL_DIR, "herg.joblib"))["model"]
+    n_total = len(df)
+    # Oracle-produced columns are the first three of TASK_NAMES; PfDHFR_Docking
+    # is not predicted yet and is excluded from the NaN drop check (it is always
+    # NaN by design).
+    oracle_columns = [c for c in TASK_NAMES if c in df.columns]
 
-    fingerprints, valid_smiles = batch_smiles_to_morgan(smiles_list)
-    if fingerprints.shape[0] == 0:
-        return np.zeros((0, 3), dtype=np.float32), valid_smiles
+    out_of_domain = df["Out_of_Domain_Warning"].to_numpy(dtype=bool)
+    has_nan_pred = df[oracle_columns].isna().any(axis=1).to_numpy()
+    drop_mask = out_of_domain | has_nan_pred
+    keep_mask = ~drop_mask
 
-    caco2_pred = caco2.predict(fingerprints)
-    # Stored in log10(hours); reverse the transform to get hours.
-    half_life_pred = 10.0 ** half_life.predict(fingerprints)
-    herg_pred = herg.predict_proba(fingerprints)[:, 1]
+    n_dropped = int(drop_mask.sum())
+    n_ood = int(out_of_domain.sum())
+    # NaN-prediction drops that were not already flagged out-of-domain.
+    n_nan_only = int((has_nan_pred & ~out_of_domain).sum())
+    print(
+        f"get_training_data: {n_total} molecules in, {int(keep_mask.sum())} kept, "
+        f"{n_dropped} dropped ({n_ood} out-of-domain, "
+        f"{n_nan_only} additional with NaN predictions)."
+    )
 
-    Y = np.column_stack([caco2_pred, half_life_pred, herg_pred]).astype(np.float32)
+    kept = df[keep_mask]
+    valid_smiles = kept["SMILES"].tolist()
+
+    # Assemble Y in TASK_NAMES order; any task the oracle does not provide (i.e.
+    # PfDHFR_Docking) stays NaN as a placeholder.
+    Y = np.full((len(valid_smiles), len(TASK_NAMES)), np.nan, dtype=np.float32)
+    for j, name in enumerate(TASK_NAMES):
+        if name in kept.columns:
+            Y[:, j] = kept[name].to_numpy(dtype=np.float32)
     return Y, valid_smiles
 
 
@@ -122,28 +138,39 @@ def train_mogp(train_x, train_y, n_iterations=200, lr=0.1):
 
     Args:
         train_x: Fingerprint matrix of shape ``(N, 2048)``, int8.
-        train_y: Target matrix of shape ``(N, 3)``, float32, columns
-            ``[caco2, half_life, herg]``.
+        train_y: Target matrix of shape ``(N, 4)``, float32, columns in
+            ``TASK_NAMES`` order.
         n_iterations: Number of Adam steps.
         lr: Adam learning rate.
 
     Returns:
         A tuple ``(model, likelihood, y_mean, y_std)`` where ``y_mean`` and
-        ``y_std`` are numpy arrays of shape ``(3,)`` used to reverse the target
-        normalization at prediction time.
+        ``y_std`` are numpy arrays of shape ``(4,)`` used to reverse the target
+        normalization at prediction time. Columns whose targets are entirely
+        unobserved (all NaN, e.g. the ``PfDHFR_Docking`` placeholder) are skipped
+        during training; their ``y_mean``/``y_std`` entries are NaN and the model
+        is fitted only on the remaining tasks.
     """
     train_x_t = torch.from_numpy(np.asarray(train_x)).to(torch.float32)
     train_y = np.asarray(train_y, dtype=np.float32)
 
-    # Per-column standardization. Guard against zero-variance columns so we never
-    # divide by zero (a constant column normalizes to 0 and reverses to its mean).
+    # Per-column standardization stats over the full task set. Columns that are
+    # not yet observed (all NaN, e.g. the PfDHFR_Docking placeholder) produce NaN
+    # stats and are skipped below: a GP cannot be trained on an unobserved target.
     y_mean = train_y.mean(axis=0)
     y_std = train_y.std(axis=0)
-    y_std[y_std == 0] = 1.0
-    train_y_norm = (train_y - y_mean) / y_std
+    # Guard zero-variance columns (constant -> normalizes to 0, reverses to its
+    # mean). NaN stats for unobserved columns are left NaN to flag "not trained".
+    y_std = np.where(y_std == 0.0, 1.0, y_std)
+
+    observed = np.isfinite(y_mean) & np.isfinite(y_std)
+    if not observed.any():
+        raise ValueError("train_mogp: no observed target columns to train on.")
+
+    train_y_norm = (train_y[:, observed] - y_mean[observed]) / y_std[observed]
     train_y_t = torch.from_numpy(train_y_norm).to(torch.float32)
 
-    num_tasks = train_y.shape[1]
+    num_tasks = int(observed.sum())
     likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=num_tasks)
     model = MOGPModel(train_x_t, train_y_t, likelihood)
 
@@ -173,14 +200,16 @@ def predict(model, likelihood, y_mean, y_std, X_new):
     Args:
         model: A trained ``MOGPModel``.
         likelihood: The matching ``MultitaskGaussianLikelihood``.
-        y_mean: Normalization means, shape ``(3,)``.
-        y_std: Normalization stds, shape ``(3,)``.
+        y_mean: Normalization means, shape ``(4,)``.
+        y_std: Normalization stds, shape ``(4,)``.
         X_new: Fingerprint matrix of shape ``(M, 2048)``, int8.
 
     Returns:
-        A tuple ``(mean, variance)`` of numpy arrays, each shape ``(M, 3)``, with
-        columns ``[caco2, half_life, herg]`` on the original (de-normalized)
-        scale. ``variance`` is the per-objective predictive variance.
+        A tuple ``(mean, variance)`` of numpy arrays, each shape ``(M, 4)``, with
+        columns in ``TASK_NAMES`` order on the original (de-normalized) scale.
+        ``variance`` is the per-objective predictive variance. Tasks that were
+        skipped during training (NaN normalization stats, e.g. ``PfDHFR_Docking``)
+        are returned as NaN columns.
     """
     X_new_t = torch.from_numpy(np.asarray(X_new)).to(torch.float32)
 
@@ -189,12 +218,19 @@ def predict(model, likelihood, y_mean, y_std, X_new):
 
     with torch.no_grad(), gpytorch.settings.fast_pred_var():
         posterior = likelihood(model(X_new_t))
-        mean = posterior.mean.cpu().numpy()
-        variance = posterior.variance.cpu().numpy()
+        mean_obs = posterior.mean.cpu().numpy()
+        variance_obs = posterior.variance.cpu().numpy()
 
-    # Reverse the per-column standardization applied during training.
-    mean = mean * y_std + y_mean
-    variance = variance * (y_std ** 2)
+    # Scatter the trained-task predictions back into the full TASK_NAMES layout,
+    # reversing the per-column standardization. Columns that were not trained
+    # (NaN normalization stats) stay NaN.
+    observed = np.isfinite(y_mean) & np.isfinite(y_std)
+    n_rows = mean_obs.shape[0]
+    n_tasks = y_mean.shape[0]
+    mean = np.full((n_rows, n_tasks), np.nan, dtype=float)
+    variance = np.full((n_rows, n_tasks), np.nan, dtype=float)
+    mean[:, observed] = mean_obs * y_std[observed] + y_mean[observed]
+    variance[:, observed] = variance_obs * (y_std[observed] ** 2)
     return mean, variance
 
 
@@ -207,15 +243,16 @@ if __name__ == "__main__":
         "Pyrimethamine": "C1=CC(=NC(=N1)N)CC2=CC=C(C=C2)Cl",
     }
 
-    print("Loading ADMET scores for training molecules...")
-    Y, valid_smiles = load_admet_scores(list(train_smiles.values()))
+    print("Building training data from the ADMET oracle...")
+    Y, valid_smiles = get_training_data(list(train_smiles.values()))
 
-    print("\nADMET target matrix Y:")
-    headers = ["caco2", "half_life_hours", "herg_prob"]
-    print(f"{'molecule':>14}" + "".join(f"{h:>18}" for h in headers))
+    print("\nADMET target matrix Y (columns in TASK_NAMES order):")
+    print(f"{'molecule':>14}" + "".join(f"{h:>22}" for h in TASK_NAMES))
     name_by_smiles = {s: n for n, s in train_smiles.items()}
     for name, row in zip((name_by_smiles[s] for s in valid_smiles), Y):
-        print(f"{name:>14}" + "".join(f"{v:18.4f}" for v in row))
+        print(f"{name:>14}" + "".join(f"{v:22.4f}" for v in row))
+    print("Note: PfDHFR_Docking is a placeholder (NaN) until the docking "
+          "module is added.")
 
     # Fingerprints for the valid training molecules.
     train_x = np.vstack([smiles_to_morgan(s) for s in valid_smiles])
@@ -233,10 +270,11 @@ if __name__ == "__main__":
     mean, variance = predict(model, likelihood, y_mean, y_std, X_new)
     std = np.sqrt(variance)
 
-    print("\nPredictions for new molecules:")
+    print("\nPredictions for new molecules (all 4 objectives):")
     for i, smiles in enumerate(new_valid):
         name = new_name_by_smiles[smiles]
         print(f"\n{name}:")
-        print(f"  caco2           = {mean[i, 0]:.4f}  (std {std[i, 0]:.4f})")
-        print(f"  half_life_hours = {mean[i, 1]:.4f}  (std {std[i, 1]:.4f})")
-        print(f"  herg_prob       = {mean[i, 2]:.4f}  (std {std[i, 2]:.4f})")
+        for j, task in enumerate(TASK_NAMES):
+            note = ("  <- placeholder (nan) until docking module is added"
+                    if task == "PfDHFR_Docking" else "")
+            print(f"  {task:<20} = {mean[i, j]:.4f}  (std {std[i, j]:.4f}){note}")
