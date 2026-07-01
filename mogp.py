@@ -28,15 +28,88 @@ from kernel import TanimotoKernel
 
 
 # The fixed column order every Y matrix / prediction in this module adheres to.
-# This is the single source of truth for objective order everywhere in mogp.py
-# (train_mogp, predict, and the demo). The first three are produced by the ADMET
-# oracle; PfDHFR_Docking is a placeholder until the docking module is added.
+# This is the SINGLE SOURCE OF TRUTH for objective order everywhere in the
+# project (train_mogp, predict, acquisition, loop, baselines, evaluation,
+# dashboard). Import TASK_NAMES rather than hard-coding column strings.
+#
+# Current objective set: a 3-objective POTENCY / SELECTIVITY / SAFETY problem.
+#   PfDHFR_Docking      minimize (strong parasite binding)
+#   hDHFR_Docking       MAXIMIZE (weak *human* binding -> selectivity)
+#   hERG_Toxicity_Prob  minimize (cardiac safety)
+#
+# Why only 3 objectives (down from the earlier 4-with-ADMET set): in higher
+# dimensions almost every evaluated point is non-dominated (the Pareto front
+# swallows the whole set), so hypervolume stops discriminating between methods.
+# Three well-chosen, partly-antagonistic objectives keep the front meaningful
+# and make cross-task correlation (PfDHFR vs hDHFR docking) the crux the
+# coregionalized GP can exploit. Caco2_Permeability and Half_Life are kept in
+# OBJECTIVE_SOURCES below so they can be re-added to TASK_NAMES later with a
+# one-line change (and a matching sign in acquisition.DEFAULT_OBJECTIVE_SIGNS).
 TASK_NAMES = [
-    "Caco2_Permeability",
-    "Half_Life",
-    "hERG_Toxicity_Prob",
     "PfDHFR_Docking",
+    "hDHFR_Docking",
+    "hERG_Toxicity_Prob",
+    # --- To re-include the ADMET objectives, add them back here (and append the
+    # matching signs to acquisition.DEFAULT_OBJECTIVE_SIGNS): ---
+    # "Caco2_Permeability",
+    # "Half_Life",
 ]
+
+
+# How each objective is PRODUCED at evaluation time. Two kinds:
+#   ("dock", "<TargetName>")    -> expensive: docking.batch_dock_target against
+#                                  that named receptor (see docking.TARGETS).
+#   ("library", "<admet_col>")  -> cheap: a precomputed column from the cached
+#                                  library (data.load_library / data.ADMET_COLUMNS).
+# This lets loop.py, the baselines and evaluation.py handle a mix of docking and
+# library objectives WITHOUT hard-coding column positions (the objectives are no
+# longer "ADMET first, one docking column last"). Entries for objectives not
+# currently in TASK_NAMES are harmless and support re-inclusion later.
+OBJECTIVE_SOURCES = {
+    "PfDHFR_Docking":     ("dock", "PfDHFR"),
+    "hDHFR_Docking":      ("dock", "hDHFR"),
+    "hERG_Toxicity_Prob": ("library", "hERG_Toxicity_Prob"),
+    "Caco2_Permeability": ("library", "Caco2_logPapp"),
+    "Half_Life":          ("library", "Half_Life_hours"),
+}
+
+
+def resolve_objective_layout(admet_columns):
+    """Map the current ``TASK_NAMES`` onto their evaluation-time data sources.
+
+    Given the cached library's ADMET column order (``data.ADMET_COLUMNS``), work
+    out — once — which objective columns come from the library and which are
+    docked, so callers never hard-code positions. Passing ``admet_columns`` in
+    (rather than importing ``data`` here) keeps this module free of a heavy
+    import cycle.
+
+    Args:
+        admet_columns: The library's ADMET column names in stored order (i.e.
+            ``data.ADMET_COLUMNS``), used to resolve a library objective's
+            column index into ``load_library()["admet_scores"]``.
+
+    Returns:
+        A tuple ``(library_tasks, docking_tasks, docking_targets)`` where:
+          * ``library_tasks``   = list of ``(task_index, admet_col_index)``
+          * ``docking_tasks``   = list of ``(task_index, target_name)``
+          * ``docking_targets`` = ordered unique target names to dock.
+    """
+    admet_columns = list(admet_columns)
+    library_tasks = []
+    docking_tasks = []
+    for j, name in enumerate(TASK_NAMES):
+        kind, ref = OBJECTIVE_SOURCES[name]
+        if kind == "library":
+            library_tasks.append((j, admet_columns.index(ref)))
+        elif kind == "dock":
+            docking_tasks.append((j, ref))
+        else:
+            raise ValueError(f"Unknown objective source {kind!r} for {name!r}.")
+    docking_targets = []
+    for _, target in docking_tasks:
+        if target not in docking_targets:
+            docking_targets.append(target)
+    return library_tasks, docking_tasks, docking_targets
 
 
 class MOGPModel(gpytorch.models.ExactGP):
@@ -91,11 +164,13 @@ def get_training_data(smiles_list):
 
     Returns:
         A tuple ``(Y, valid_smiles)`` where ``Y`` is a numpy array of shape
-        ``(N_valid, 4)``, float32, with columns in ``TASK_NAMES`` order
-        ``[Caco2_Permeability, Half_Life, hERG_Toxicity_Prob, PfDHFR_Docking]``.
-        The ``PfDHFR_Docking`` column is filled with NaN as a placeholder until
-        the docking module is added. ``valid_smiles`` is the list of SMILES that
-        passed the filter (in input order).
+        ``(N_valid, len(TASK_NAMES))``, float32, with columns in ``TASK_NAMES``
+        order. Only objectives the ADMET oracle supplies (the ``"library"``
+        sources in ``OBJECTIVE_SOURCES``, e.g. ``hERG_Toxicity_Prob``) are
+        filled; the docking objectives (``PfDHFR_Docking``, ``hDHFR_Docking``)
+        stay NaN as placeholders until the docking oracle is run.
+        ``valid_smiles`` is the list of SMILES that passed the filter (in input
+        order).
     """
     oracle = ADMETOracle()
     df = oracle.predict(smiles_list)
@@ -251,8 +326,8 @@ if __name__ == "__main__":
     name_by_smiles = {s: n for n, s in train_smiles.items()}
     for name, row in zip((name_by_smiles[s] for s in valid_smiles), Y):
         print(f"{name:>14}" + "".join(f"{v:22.4f}" for v in row))
-    print("Note: PfDHFR_Docking is a placeholder (NaN) until the docking "
-          "module is added.")
+    print("Note: the docking objectives (PfDHFR_Docking, hDHFR_Docking) are "
+          "placeholders (NaN) here until the docking oracle is run.")
 
     # Fingerprints for the valid training molecules.
     train_x = np.vstack([smiles_to_morgan(s) for s in valid_smiles])
@@ -275,6 +350,6 @@ if __name__ == "__main__":
         name = new_name_by_smiles[smiles]
         print(f"\n{name}:")
         for j, task in enumerate(TASK_NAMES):
-            note = ("  <- placeholder (nan) until docking module is added"
-                    if task == "PfDHFR_Docking" else "")
+            note = ("  <- placeholder (nan) until docking oracle is run"
+                    if OBJECTIVE_SOURCES[task][0] == "dock" else "")
             print(f"  {task:<20} = {mean[i, j]:.4f}  (std {std[i, j]:.4f}){note}")

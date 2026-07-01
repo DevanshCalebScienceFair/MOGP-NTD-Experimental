@@ -2,26 +2,36 @@
 docking.py
 ==========
 
-Structure-based binding-affinity oracle for *Plasmodium falciparum*
-dihydrofolate reductase (PfDHFR), the validated antimalarial target.
+Structure-based binding-affinity oracle for dihydrofolate reductase (DHFR),
+docking against a **named** target instead of a single hardcoded one.
+
+Two targets are provided (see ``TARGETS``):
+
+  * ``"PfDHFR"`` — *Plasmodium falciparum* DHFR (PDB 1J3I), the validated
+    antimalarial target. We want STRONG binding (very negative kcal/mol).
+  * ``"hDHFR"``  — *human* DHFR (PDB 1U72, verified Homo sapiens DHFR ternary
+    complex with methotrexate + NADPH). This is the anti-target: we want WEAK
+    binding, so a compound is selective for the parasite over the human enzyme.
 
 Given a SMILES string this module produces a 3D conformer, docks it into the
-PfDHFR active site (PDB 1J3I) with AutoDock Vina, and returns the predicted
-binding affinity in **kcal/mol**. Scores are free energies of binding:
-*more negative = stronger predicted binding*. A known inhibitor such as
-pyrimethamine should reach roughly -7 to -9 kcal/mol, while a non-binder such
-as aspirin should score noticeably weaker (less negative).
+chosen target's active site with AutoDock Vina, and returns the predicted
+binding affinity in **kcal/mol** (*more negative = stronger binding*). A known
+inhibitor such as pyrimethamine should reach roughly -7 to -9 kcal/mol against
+PfDHFR, while a non-binder such as aspirin scores noticeably weaker.
 
-This file supplies the 4th objective column for the multi-objective GP:
-``PfDHFR_Docking``. It is the structure-based counterpart to the property
-predictions in ``admet_oracle.py`` and consumes the same SMILES inputs that
-``utils/featurize.py`` turns into Morgan fingerprints for ``mogp.py``.
+These scores supply the two docking objectives of the multi-objective GP:
+``PfDHFR_Docking`` (minimize) and ``hDHFR_Docking`` (maximize -> selectivity).
+Both consume the same SMILES inputs that ``utils/featurize.py`` turns into
+Morgan fingerprints for ``mogp.py``. Docking cost therefore roughly doubles
+(two receptors per molecule) — that is expected.
 
-Pipeline per molecule:
-    download_protein()  -> 1J3I.pdb        (RCSB)
-    prepare_protein()   -> 1J3I_clean.pdb  (strip HETATM/water, keep protein)
-    prepare_ligand()    -> ligand.pdbqt    (RDKit 3D embed -> Meeko)
-    dock()              -> best affinity   (AutoDock Vina, kcal/mol)
+Pipeline per molecule and target:
+    download_protein(target)  -> <PDB>.pdb        (RCSB)
+    prepare_protein(target)   -> <PDB>_clean.pdb  (strip HETATM/water)
+    prepare_ligand(smiles)    -> ligand.pdbqt     (RDKit 3D embed -> Meeko)
+    dock_target(smiles, tgt)  -> best affinity    (AutoDock Vina, kcal/mol)
+
+Prepared receptors are cached per target (``<PDB>_clean.pdbqt``).
 
 Install (if not already present in the `mogp-drug` conda env):
     # AutoDock Vina CLI on PATH (conda install -c conda-forge vina)
@@ -41,50 +51,100 @@ from rdkit.Chem import AllChem
 import meeko
 
 
-# Local file names produced by the setup steps, relative to the project root.
-PROTEIN_PDB_ID = "1J3I"
-PROTEIN_PDB = f"{PROTEIN_PDB_ID}.pdb"
-PROTEIN_CLEAN_PDB = f"{PROTEIN_PDB_ID}_clean.pdb"
-PROTEIN_PDBQT = f"{PROTEIN_PDB_ID}_clean.pdbqt"
-PROTEIN_URL = f"https://files.rcsb.org/download/{PROTEIN_PDB_ID}.pdb"
+# ---------------------------------------------------------------------- #
+# Docking targets. Each is a rigid receptor prepared from an RCSB PDB, with a
+# binding box centered on the folate/active-site region (the centroid of the
+# co-crystallized inhibitor's folate-mimicking head, so the flexible tail does
+# not pull the box off the catalytic pocket — same recipe for both targets).
+# ---------------------------------------------------------------------- #
+TARGETS = {
+    "PfDHFR": {
+        "pdb_id": "1J3I",
+        # Centroid of the rigid diaminotriazine head of the co-crystallized
+        # inhibitor WR99210 (HETATM "WRA", chain A) beside the NADPH cofactor.
+        "center": (30.5, 5.2, 57.3),
+        "size": (20.0, 20.0, 20.0),
+        "description": "Plasmodium falciparum DHFR (antimalarial target; minimize).",
+    },
+    "hDHFR": {
+        "pdb_id": "1U72",
+        # Verified HUMAN DHFR: 1U72 is the Homo sapiens DHFR ternary complex with
+        # methotrexate (MTX) + NADPH (single chain A). Box centered on the
+        # centroid of MTX's 2,4-diaminopteridine head — the folate-mimicking
+        # pharmacophore, analogous to the diaminotriazine head used for PfDHFR.
+        "center": (28.4, 13.0, -2.7),
+        "size": (20.0, 20.0, 20.0),
+        "description": "Human DHFR (off-target selectivity; PDB 1U72; maximize).",
+    },
+}
+
+# Default target for the backward-compatible dock()/batch_dock() helpers.
+DEFAULT_TARGET = "PfDHFR"
 
 
-def download_protein():
-    """Download the PfDHFR structure (PDB 1J3I) from RCSB to the project root.
+def _target_spec(target):
+    """Return the ``TARGETS`` entry for ``target`` or raise a clear error."""
+    if target not in TARGETS:
+        raise ValueError(
+            f"Unknown docking target {target!r}; known targets: {list(TARGETS)}"
+        )
+    return TARGETS[target]
 
-    Saves the file as ``1J3I.pdb``. If it already exists the download is
-    skipped silently. Prints a confirmation only when a fresh download occurs.
+
+def _target_paths(target):
+    """Local (raw, clean, pdbqt) receptor file names for ``target``."""
+    pdb_id = _target_spec(target)["pdb_id"]
+    return (f"{pdb_id}.pdb", f"{pdb_id}_clean.pdb", f"{pdb_id}_clean.pdbqt")
+
+
+def download_protein(target=DEFAULT_TARGET):
+    """Download the ``target`` receptor structure from RCSB to the project root.
+
+    Saves ``<PDB>.pdb``. If it already exists the download is skipped silently;
+    a confirmation is printed only on a fresh download.
+
+    Args:
+        target: A key of ``TARGETS`` (e.g. ``"PfDHFR"`` or ``"hDHFR"``).
 
     Returns:
-        The path to the local PDB file (``1J3I.pdb``).
+        The path to the local PDB file (``<PDB>.pdb``).
     """
-    if os.path.exists(PROTEIN_PDB):
-        return PROTEIN_PDB
+    pdb_id = _target_spec(target)["pdb_id"]
+    raw_pdb, _, _ = _target_paths(target)
+    if os.path.exists(raw_pdb):
+        return raw_pdb
 
     # urllib is part of the stdlib, so no extra dependency just to fetch a file.
     import urllib.request
 
-    urllib.request.urlretrieve(PROTEIN_URL, PROTEIN_PDB)
-    print(f"Downloaded {PROTEIN_PDB_ID} structure to {PROTEIN_PDB}")
-    return PROTEIN_PDB
+    urllib.request.urlretrieve(
+        f"https://files.rcsb.org/download/{pdb_id}.pdb", raw_pdb
+    )
+    print(f"Downloaded {pdb_id} ({target}) structure to {raw_pdb}")
+    return raw_pdb
 
 
-def prepare_protein(pdb_path=PROTEIN_PDB):
-    """Strip ligands and waters from the PDB, keeping only protein atoms.
+def prepare_protein(target=DEFAULT_TARGET, pdb_path=None):
+    """Strip ligands and waters from the ``target`` PDB, keeping only protein atoms.
 
     Uses Biopython to drop every HETATM record (bound ligands, ions, and
     crystallographic waters) and keep only standard ``ATOM`` protein records,
-    writing the result to ``1J3I_clean.pdb``.
+    writing the result to ``<PDB>_clean.pdb`` (cached per target).
 
     Args:
-        pdb_path: Path to the raw PDB file (default ``1J3I.pdb``).
+        target: A key of ``TARGETS``.
+        pdb_path: Optional path to the raw PDB (defaults to the target's file).
 
     Returns:
-        The path to the cleaned protein PDB (``1J3I_clean.pdb``). If that file
-        already exists the cleaning step is skipped and the path is returned.
+        The path to the cleaned protein PDB (``<PDB>_clean.pdb``). If it already
+        exists the cleaning step is skipped and the path is returned.
     """
-    if os.path.exists(PROTEIN_CLEAN_PDB):
-        return PROTEIN_CLEAN_PDB
+    pdb_id = _target_spec(target)["pdb_id"]
+    raw_pdb, clean_pdb, _ = _target_paths(target)
+    if pdb_path is None:
+        pdb_path = raw_pdb
+    if os.path.exists(clean_pdb):
+        return clean_pdb
 
     from Bio.PDB import PDBParser, PDBIO, Select
 
@@ -99,12 +159,12 @@ def prepare_protein(pdb_path=PROTEIN_PDB):
             return hetflag == " "
 
     parser = PDBParser(QUIET=True)
-    structure = parser.get_structure(PROTEIN_PDB_ID, pdb_path)
+    structure = parser.get_structure(pdb_id, pdb_path)
 
     io = PDBIO()
     io.set_structure(structure)
-    io.save(PROTEIN_CLEAN_PDB, select=ProteinOnly())
-    return PROTEIN_CLEAN_PDB
+    io.save(clean_pdb, select=ProteinOnly())
+    return clean_pdb
 
 
 def prepare_ligand(smiles):
@@ -196,19 +256,22 @@ def _meeko_pdbqt_string(mol):
     return prep.write_pdbqt_string()
 
 
-def _prepare_receptor_pdbqt(clean_pdb_path):
-    """Convert the cleaned protein PDB to the PDBQT receptor Vina requires.
+def _prepare_receptor_pdbqt(target=DEFAULT_TARGET, clean_pdb_path=None):
+    """Convert the ``target`` cleaned protein PDB to the PDBQT receptor Vina needs.
 
     AutoDock Vina's Python API only accepts a rigid receptor in PDBQT format,
     which carries the AutoDock atom types and partial charges that the plain
-    PDB from ``prepare_protein`` lacks. This is cached as ``1J3I_clean.pdbqt``.
+    PDB from ``prepare_protein`` lacks. Cached per target as ``<PDB>_clean.pdbqt``.
 
     Conversion uses Open Babel: it adds hydrogens, assigns Gasteiger partial
     charges, and writes a rigid (torsion-tree-free) receptor. Meeko's
     ``PDBQTReceptor`` only *reads* existing PDBQT, so it cannot be used here.
     """
-    if os.path.exists(PROTEIN_PDBQT):
-        return PROTEIN_PDBQT
+    _, clean_pdb, receptor_pdbqt = _target_paths(target)
+    if clean_pdb_path is None:
+        clean_pdb_path = clean_pdb
+    if os.path.exists(receptor_pdbqt):
+        return receptor_pdbqt
 
     try:
         from openbabel import pybel
@@ -223,8 +286,8 @@ def _prepare_receptor_pdbqt(clean_pdb_path):
     protein.addh()
     # "r" => write a single rigid molecule (no torsion tree), as needed for a
     # docking receptor. Open Babel computes Gasteiger charges by default.
-    protein.write("pdbqt", PROTEIN_PDBQT, overwrite=True, opt={"r": None})
-    return PROTEIN_PDBQT
+    protein.write("pdbqt", receptor_pdbqt, overwrite=True, opt={"r": None})
+    return receptor_pdbqt
 
 
 def _parse_best_affinity(stdout):
@@ -264,29 +327,32 @@ def _parse_best_affinity(stdout):
     return min(affinities)
 
 
-def dock(smiles, n_poses=9):
-    """Dock a single molecule into the PfDHFR active site and return the score.
+def dock_target(smiles, target=DEFAULT_TARGET, n_poses=9):
+    """Dock a single molecule into a NAMED target's active site; return the score.
 
     Runs the full pipeline (download -> clean protein -> prepare ligand ->
-    Vina) and returns the best (most negative) binding affinity across all
-    poses, in kcal/mol. Vina is invoked as a command-line tool via
+    Vina) for ``target`` and returns the best (most negative) binding affinity
+    across all poses, in kcal/mol. Vina is invoked as a command-line tool via
     ``subprocess`` (the ``vina`` Python package does not build on Apple
     Silicon), and the affinity is parsed from its stdout table.
 
     Args:
         smiles: The ligand SMILES string.
+        target: A key of ``TARGETS`` (default ``"PfDHFR"``). Its binding box
+            (center + size) is taken from the registry.
         n_poses: Number of poses for Vina to generate (default 9).
 
     Returns:
-        The best binding affinity as a float (kcal/mol, more negative = better),
-        or ``None`` if docking fails for any reason (a warning is printed).
+        The best binding affinity as a float (kcal/mol, more negative = stronger
+        binding), or ``None`` if docking fails for any reason (warning printed).
     """
+    spec = _target_spec(target)
     ligand_pdbqt = None
     out_pdbqt = None
     try:
-        download_protein()
-        clean_pdb = prepare_protein()
-        receptor_pdbqt = _prepare_receptor_pdbqt(clean_pdb)
+        download_protein(target)
+        clean_pdb = prepare_protein(target)
+        receptor_pdbqt = _prepare_receptor_pdbqt(target, clean_pdb)
         ligand_pdbqt = prepare_ligand(smiles)
 
         # Vina requires an --out path for the docked poses even though we only
@@ -296,23 +362,21 @@ def dock(smiles, n_poses=9):
         out_pdbqt = out_file.name
         out_file.close()
 
-        # Binding box centered on the PfDHFR antifolate active site of PDB 1J3I.
-        # The center is the centroid of the rigid diaminotriazine head of the
-        # co-crystallized inhibitor WR99210 (HETATM residue "WRA", chain A) —
-        # the pharmacophore that overlays the pyrimethamine diaminopyrimidine
-        # core, beside the NADPH cofactor. Using the head rather than the whole
-        # molecule avoids the flexible dichlorophenoxy tail pulling the box off
-        # the catalytic pocket. A 20 A cube comfortably encloses the site.
+        # Binding box from the target registry, centered on the folate/active
+        # site (the co-crystallized inhibitor's folate-mimicking head — see
+        # TARGETS). A 20 A cube comfortably encloses the pocket.
+        cx, cy, cz = spec["center"]
+        sx, sy, sz = spec["size"]
         cmd = [
             "vina",
             "--receptor", receptor_pdbqt,
             "--ligand", ligand_pdbqt,
-            "--center_x", "30.5",
-            "--center_y", "5.2",
-            "--center_z", "57.3",
-            "--size_x", "20",
-            "--size_y", "20",
-            "--size_z", "20",
+            "--center_x", str(cx),
+            "--center_y", str(cy),
+            "--center_z", str(cz),
+            "--size_x", str(sx),
+            "--size_y", str(sy),
+            "--size_z", str(sz),
             "--exhaustiveness", "8",
             "--num_modes", str(n_poses),
             "--out", out_pdbqt,
@@ -323,7 +387,7 @@ def dock(smiles, n_poses=9):
 
         return _parse_best_affinity(result.stdout)
     except Exception as exc:
-        warnings.warn(f"Docking failed for SMILES {smiles!r}: {exc}")
+        warnings.warn(f"Docking failed for SMILES {smiles!r} against {target}: {exc}")
         return None
     finally:
         for path in (ligand_pdbqt, out_pdbqt):
@@ -331,11 +395,12 @@ def dock(smiles, n_poses=9):
                 os.remove(path)
 
 
-def batch_dock(smiles_list, n_jobs=1):
-    """Dock a list of molecules sequentially, returning their affinities.
+def batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=1):
+    """Dock a list of molecules against ONE named target, returning affinities.
 
     Args:
         smiles_list: An iterable of SMILES strings.
+        target: A key of ``TARGETS`` (default ``"PfDHFR"``).
         n_jobs: Reserved for future parallelism. Only ``n_jobs=1`` (sequential)
             is implemented for now.
 
@@ -349,18 +414,61 @@ def batch_dock(smiles_list, n_jobs=1):
     scores = np.full(n, np.nan, dtype=np.float64)
 
     for i, smiles in enumerate(smiles_list):
-        print(f"Docking molecule {i + 1}/{n}...")
-        result = dock(smiles)
+        print(f"Docking molecule {i + 1}/{n} against {target}...")
+        result = dock_target(smiles, target=target)
         if result is not None:
             scores[i] = result
 
     return scores
 
 
+def batch_dock_targets(smiles_list, targets):
+    """Dock a list of molecules against SEVERAL named targets.
+
+    Args:
+        smiles_list: An iterable of SMILES strings.
+        targets: Iterable of target names (keys of ``TARGETS``).
+
+    Returns:
+        A dict ``{target_name: np.ndarray shape (N,)}`` of affinities, each
+        aligned to ``smiles_list`` order (NaN on failure). Docking cost scales
+        with the number of targets — two targets ~doubles the cost, as expected.
+    """
+    smiles_list = list(smiles_list)
+    return {t: batch_dock_target(smiles_list, target=t) for t in targets}
+
+
+def docked_summary(docking_by_target, n):
+    """Human-readable per-target docked-count summary.
+
+    E.g. ``'PfDHFR 9/10, hDHFR 8/10'`` for a batch of ``n`` molecules, given the
+    dict returned by ``batch_dock_targets``. Shared by loop.py and the baselines.
+    """
+    return ", ".join(
+        f"{t} {int(np.isfinite(v).sum())}/{n}"
+        for t, v in docking_by_target.items()
+    )
+
+
+# ------------------------------------------------------------------ #
+# Backward-compatible single-target (PfDHFR) helpers.
+# ------------------------------------------------------------------ #
+def dock(smiles, n_poses=9):
+    """Dock a single molecule against the default target (PfDHFR). See dock_target."""
+    return dock_target(smiles, target=DEFAULT_TARGET, n_poses=n_poses)
+
+
+def batch_dock(smiles_list, n_jobs=1):
+    """Dock a list against the default target (PfDHFR). See batch_dock_target."""
+    return batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=n_jobs)
+
+
 if __name__ == "__main__":
-    # Validation set: two antimalarials that engage PfDHFR and one negative
-    # control. Pyrimethamine is a textbook PfDHFR inhibitor, so a correctly
-    # centered binding box must score it strongly.
+    # Validation set: an antimalarial that engages PfDHFR, an unrelated drug, and
+    # a negative control. Pyrimethamine is a textbook PfDHFR inhibitor, so a
+    # correctly centered PfDHFR box must score it strongly. We also dock every
+    # molecule against the human DHFR box (1U72) and report the Selectivity Index
+    # (hDHFR - PfDHFR): higher = more parasite-selective.
     molecules = {
         "Pyrimethamine": "C1=CC(=NC(=N1)N)CC2=CC=C(C=C2)Cl",
         "Chloroquine":   "CCN(CC)CCCC(C)NC1=C2C=CC(=CC2=NC=C1)Cl",
@@ -368,18 +476,27 @@ if __name__ == "__main__":
     }
 
     names = list(molecules.keys())
-    scores = batch_dock(list(molecules.values()))
+    smiles_list = list(molecules.values())
+
+    print(f"Docking {len(names)} molecules against both targets: {list(TARGETS)}")
+    scores = batch_dock_targets(smiles_list, list(TARGETS))  # dict target -> (N,)
+    pf = scores["PfDHFR"]
+    hu = scores["hDHFR"]
 
     print()
-    for name, score in zip(names, scores):
-        if np.isnan(score):
-            print(f"{name}: docking failed")
-        else:
-            print(f"{name}: {score:.2f} kcal/mol")
+    print(f"{'molecule':<16}{'PfDHFR':>10}{'hDHFR':>10}{'Selectivity':>14}")
+    for i, name in enumerate(names):
+        pf_s = f"{pf[i]:.2f}" if not np.isnan(pf[i]) else "fail"
+        hu_s = f"{hu[i]:.2f}" if not np.isnan(hu[i]) else "fail"
+        # Selectivity Index = hDHFR - PfDHFR (higher = weaker human / stronger
+        # parasite binding = more selective).
+        si = (hu[i] - pf[i]) if not (np.isnan(pf[i]) or np.isnan(hu[i])) else np.nan
+        si_s = f"{si:+.2f}" if not np.isnan(si) else "n/a"
+        print(f"{name:<16}{pf_s:>10}{hu_s:>10}{si_s:>14}")
 
-    pyrimethamine_score = scores[names.index("Pyrimethamine")]
+    pyrimethamine_pf = pf[names.index("Pyrimethamine")]
     print()
-    if not np.isnan(pyrimethamine_score) and pyrimethamine_score < -7.0:
-        print("VALIDATION PASSED")
+    if not np.isnan(pyrimethamine_pf) and pyrimethamine_pf < -7.0:
+        print("VALIDATION PASSED (pyrimethamine binds PfDHFR strongly)")
     else:
-        print("VALIDATION FAILED - check binding box coordinates")
+        print("VALIDATION FAILED - check PfDHFR binding box coordinates")

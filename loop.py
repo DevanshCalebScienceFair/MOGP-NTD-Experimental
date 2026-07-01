@@ -8,20 +8,21 @@ reductase (PfDHFR).
 
 Each iteration:
     1. Train the multi-output GP (``mogp.py``) on every molecule evaluated so
-       far, across the four objectives in ``TASK_NAMES``:
-       [Caco2_Permeability, Half_Life, hERG_Toxicity_Prob, PfDHFR_Docking].
+       far, across the objectives in ``TASK_NAMES`` (a potency / selectivity /
+       safety set: [PfDHFR_Docking, hDHFR_Docking, hERG_Toxicity_Prob]).
     2. Score the un-evaluated library with EHVI and pick a diverse batch
        (``acquisition.select_batch``).
-    3. Run the expensive structure-based docking oracle (``docking.batch_dock``)
-       on only that batch — docking is the costly objective the cheap ADMET /
-       fingerprint features (precomputed in ``data.py``) are there to avoid.
+    3. Run the expensive structure-based docking oracle on only that batch,
+       against EVERY target (``docking.batch_dock_targets`` — PfDHFR and hDHFR).
+       Docking is the costly objective the cheap ADMET / fingerprint features
+       (precomputed in ``data.py``) are there to avoid; two targets ~double it.
     4. Append the new evaluations, recompute the Pareto front and hypervolume,
        and record history.
 
-The cheap per-molecule quantities (Morgan fingerprints + the first three ADMET
-objectives) are pulled straight from the cached library built by ``data.py``;
-the loop never recomputes them. Only the 4th objective (docking) is evaluated
-on the fly, for the selected batch.
+The cheap per-molecule quantities (Morgan fingerprints + the library ADMET
+objectives, e.g. hERG) are pulled straight from the cached library built by
+``data.py``; the loop never recomputes them. Only the docking objectives are
+evaluated on the fly, for the selected batch.
 
 Run ``python loop.py --help`` for the command-line options.
 """
@@ -34,8 +35,8 @@ import numpy as np
 import torch
 import pandas as pd
 
-from data import load_library
-from mogp import train_mogp, predict, TASK_NAMES
+from data import load_library, ADMET_COLUMNS as LIBRARY_ADMET_COLUMNS
+from mogp import train_mogp, predict, TASK_NAMES, resolve_objective_layout
 from acquisition import (
     select_batch,
     compute_pareto_front,
@@ -43,14 +44,21 @@ from acquisition import (
     DEFAULT_OBJECTIVE_SIGNS,
 )
 import evaluation
-from docking import batch_dock
+from docking import batch_dock_targets, docked_summary
 
 
-# Objective layout (matches TASK_NAMES). The library supplies the first three
-# (ADMET) columns; docking fills the fourth at evaluation time.
+# Objective -> data-source layout, resolved once from TASK_NAMES. Some objectives
+# come from the cached library (cheap ADMET), the rest are docked (expensive),
+# possibly against several targets. This replaces the old "ADMET cols 0-2,
+# docking col 3" assumption, which no longer holds now that two of the three
+# objectives are docking scores against different receptors.
 N_OBJECTIVES = len(TASK_NAMES)
-ADMET_COLUMNS = slice(0, 3)      # Caco2_Permeability, Half_Life, hERG_Toxicity_Prob
-DOCKING_COLUMN = 3               # PfDHFR_Docking
+LIBRARY_TASKS, DOCKING_TASKS, DOCKING_TARGETS = resolve_objective_layout(
+    LIBRARY_ADMET_COLUMNS
+)
+# The generalization of the old single DOCKING_COLUMN: the set of objective
+# columns filled by docking.
+DOCKING_COLUMNS = [j for j, _ in DOCKING_TASKS]
 
 
 class BOLoop:
@@ -64,11 +72,20 @@ class BOLoop:
     def __init__(self, library_dir="data/library", seed=42,
                  n_init=10, batch_size=20, n_iterations=10,
                  mogp_train_iters=200, mogp_lr=0.1,
-                 diversity_threshold=0.7):
+                 diversity_threshold=0.7, train_fn=train_mogp):
         # --- Reproducibility ---
         self.seed = seed
         np.random.seed(seed)
         torch.manual_seed(seed)
+
+        # --- GP training function ---
+        # Defaults to the batch-independent mogp.train_mogp. run_ablation.py
+        # swaps in mogp_coregionalized.train_mogp_coregionalized (same signature
+        # and return contract) to compare against the ICM model. The rest of the
+        # loop — EHVI selection via acquisition.select_batch, which decodes the
+        # posterior through the model-agnostic mogp.predict — is identical either
+        # way, so the model is the only thing that varies in the ablation.
+        self.train_fn = train_fn
 
         # --- Library (cheap precomputed features) ---
         library = load_library(library_dir)
@@ -95,24 +112,31 @@ class BOLoop:
     # Evaluation helper
     # ------------------------------------------------------------------ #
     def _evaluate(self, library_indices):
-        """Build the (k, 4) objective matrix for the given library indices.
+        """Build the ``(k, N_OBJECTIVES)`` objective matrix for the given indices.
 
-        ADMET objectives come from the cached library; the docking objective is
-        evaluated on the fly with ``batch_dock``. Failed docks stay NaN.
+        Library objectives (cheap ADMET, e.g. hERG) come from the cached library;
+        the docking objectives are evaluated on the fly, docking EACH selected
+        molecule against EVERY required target (``DOCKING_TARGETS`` — PfDHFR and
+        hDHFR), which roughly doubles docking cost. Failed docks stay NaN.
 
         Returns:
-            A tuple ``(Y, docking)`` where ``Y`` has shape ``(k, 4)`` and
-            ``docking`` is the ``(k,)`` docking score vector.
+            A tuple ``(Y, docking_by_target)`` where ``Y`` has shape
+            ``(k, N_OBJECTIVES)`` and ``docking_by_target`` maps each target name
+            to its ``(k,)`` docking-score vector.
         """
         library_indices = list(library_indices)
         smiles = [self.smiles[i] for i in library_indices]
+        admet_rows = self.admet_scores[library_indices]
 
-        docking = batch_dock(smiles)                          # (k,), NaN on fail
+        # Dock the batch against every required target (PfDHFR + hDHFR).
+        docking_by_target = batch_dock_targets(smiles, DOCKING_TARGETS)
 
         Y = np.full((len(library_indices), N_OBJECTIVES), np.nan, dtype=np.float64)
-        Y[:, ADMET_COLUMNS] = self.admet_scores[library_indices]
-        Y[:, DOCKING_COLUMN] = docking
-        return Y, docking
+        for j, col in LIBRARY_TASKS:
+            Y[:, j] = admet_rows[:, col]
+        for j, target in DOCKING_TASKS:
+            Y[:, j] = docking_by_target[target]
+        return Y, docking_by_target
 
     # ------------------------------------------------------------------ #
     # Pareto / hypervolume helpers (on the currently-active objectives)
@@ -168,20 +192,27 @@ class BOLoop:
         self.evaluated_indices = list(init_indices)
         self.Y_evaluated = Y
 
-        n_docked = int(np.isfinite(docking).sum())
         print(f"Initialized {self.n_init} molecules; "
-              f"{n_docked}/{self.n_init} docked successfully.")
+              f"docked {docked_summary(docking, self.n_init)}.")
 
     def step(self):
         """Run one BO iteration: train, select, dock, record."""
         iteration = len(self.history) + 1
 
-        # --- Train the MOGP on everything evaluated so far ---
-        train_x = self.fingerprints[self.evaluated_indices]
-        train_y = self.Y_evaluated.astype(np.float32)
-        print(f"\n[Iteration {iteration}] Training MOGP on "
-              f"{len(self.evaluated_indices)} molecules...")
-        model, likelihood, y_mean, y_std = train_mogp(
+        # --- Train the GP on everything fully evaluated so far ---
+        # Restrict to rows that are finite across the currently-active objectives
+        # (a failed dock leaves a NaN that would poison per-column standardization
+        # and, for the coregionalized model, is disallowed outright). This makes
+        # both the independent and coregionalized train_fn robust to dock failures.
+        active = get_active_objectives(self.Y_evaluated)
+        eval_idx = np.asarray(self.evaluated_indices)
+        finite_rows = np.isfinite(self.Y_evaluated[:, active]).all(axis=1)
+        train_x = self.fingerprints[eval_idx[finite_rows]]
+        train_y = self.Y_evaluated[finite_rows].astype(np.float32)
+        print(f"\n[Iteration {iteration}] Training GP on "
+              f"{int(finite_rows.sum())}/{len(self.evaluated_indices)} "
+              f"fully-evaluated molecules...")
+        model, likelihood, y_mean, y_std = self.train_fn(
             train_x, train_y,
             n_iterations=self.mogp_train_iters, lr=self.mogp_lr,
         )
@@ -216,9 +247,9 @@ class BOLoop:
         assert not (set(int(i) for i in selected_library_indices) & evaluated_set), \
             "select_batch returned an already-evaluated molecule"
 
-        # --- Dock the selected batch ---
+        # --- Dock the selected batch (against every target) ---
         Y_new, docking_new = self._evaluate(list(selected_library_indices))
-        n_docked = int(np.isfinite(docking_new).sum())
+        batch_docked = docked_summary(docking_new, len(selected_library_indices))
 
         self.evaluated_indices.extend(int(i) for i in selected_library_indices)
         self.Y_evaluated = np.vstack([self.Y_evaluated, Y_new])
@@ -239,7 +270,7 @@ class BOLoop:
         print(f"[Iteration {iteration}] "
               f"evaluated={len(self.evaluated_indices)}, "
               f"batch={len(selected_library_indices)}, "
-              f"docked_this_batch={n_docked}/{len(selected_library_indices)}, "
+              f"docked_this_batch=[{batch_docked}], "
               f"pareto_size={pareto_size}, hypervolume={hypervolume:.4f}")
 
     def run(self):
@@ -289,20 +320,24 @@ class BOLoop:
         history_path = os.path.join(output_dir, "history.csv")
         history_df.to_csv(history_path, index=False)
 
-        # evaluated.csv — every evaluated molecule with all 4 objectives.
+        # evaluated.csv — every evaluated molecule with all objectives, plus the
+        # reported-only Selectivity Index (derived from the two docking columns).
         evaluated_df = pd.DataFrame(
             {"SMILES": [self.smiles[i] for i in self.evaluated_indices]}
         )
         for j, name in enumerate(TASK_NAMES):
             evaluated_df[name] = self.Y_evaluated[:, j]
+        evaluation.add_selectivity_index(evaluated_df)
         evaluated_path = os.path.join(output_dir, "evaluated.csv")
         evaluated_df.to_csv(evaluated_path, index=False)
 
-        # pareto_front.csv — only the Pareto-optimal molecules.
+        # pareto_front.csv — only the Pareto-optimal molecules, with the
+        # Selectivity Index (hDHFR - PfDHFR; higher = more parasite-selective).
         pareto = self.get_pareto_front()
         pareto_df = pd.DataFrame({"SMILES": pareto["smiles"]})
         for j, name in enumerate(TASK_NAMES):
             pareto_df[name] = pareto["objectives"][:, j]
+        evaluation.add_selectivity_index(pareto_df)
         pareto_path = os.path.join(output_dir, "pareto_front.csv")
         pareto_df.to_csv(pareto_path, index=False)
 

@@ -23,8 +23,8 @@ all four objectives jointly and recovers Pareto-optimal molecules that the
 filter discards outright.
 
 Objective layout (matches ``mogp.TASK_NAMES`` / ``loop.py``):
-    Y columns = [Caco2_Permeability, Half_Life, hERG_Toxicity_Prob, PfDHFR_Docking]
-    The first three (ADMET) come from the cached library; the fourth (docking) is
+    Y columns = [PfDHFR_Docking, hDHFR_Docking, hERG_Toxicity_Prob]
+    hERG comes from the cached library; the two docking objectives are
     evaluated on the fly for each docked batch.
 
 Run ``python baseline_greedy.py --help`` for the command-line options.
@@ -37,29 +37,31 @@ import argparse
 import numpy as np
 import pandas as pd
 
-from data import load_library
-from mogp import TASK_NAMES
+from data import load_library, ADMET_COLUMNS as LIBRARY_ADMET_COLUMNS
+from mogp import TASK_NAMES, resolve_objective_layout
 from acquisition import (
     compute_pareto_front,
     get_active_objectives,
     DEFAULT_OBJECTIVE_SIGNS,
 )
 import evaluation
-from docking import batch_dock
+from docking import batch_dock_targets, docked_summary
 
 
-# Objective layout (matches TASK_NAMES, identical to loop.py). The library
-# supplies the first three (ADMET) columns; docking fills the fourth at
-# evaluation time.
+# Objective -> data-source layout (identical to loop.py): which columns come
+# from the cached library and which are docked, against which targets.
 N_OBJECTIVES = len(TASK_NAMES)
-ADMET_COLUMNS = slice(0, 3)      # Caco2_Permeability, Half_Life, hERG_Toxicity_Prob
-DOCKING_COLUMN = 3               # PfDHFR_Docking
+LIBRARY_TASKS, DOCKING_TASKS, DOCKING_TARGETS = resolve_objective_layout(
+    LIBRARY_ADMET_COLUMNS
+)
 
-# Column indices within the (N, 3) ADMET matrix, in load_library() order
-# [Caco2_logPapp, Half_Life_hours, hERG_Toxicity_Prob]. Used by the hard filters.
-CACO2_COL = 0
-HALFLIFE_COL = 1
-HERG_COL = 2
+# Column indices within the (N, 3) library ADMET matrix, resolved by name from
+# load_library() order [Caco2_logPapp, Half_Life_hours, hERG_Toxicity_Prob].
+# The hard filters use ALL three cheap ADMET properties (the "filter-then-dock"
+# premise), independent of which of them are GP objectives.
+CACO2_COL = LIBRARY_ADMET_COLUMNS.index("Caco2_logPapp")
+HALFLIFE_COL = LIBRARY_ADMET_COLUMNS.index("Half_Life_hours")
+HERG_COL = LIBRARY_ADMET_COLUMNS.index("hERG_Toxicity_Prob")
 
 
 class GreedyFilterThenDock:
@@ -158,24 +160,30 @@ class GreedyFilterThenDock:
     # Evaluation helper (identical to loop.BOLoop._evaluate)
     # ------------------------------------------------------------------ #
     def _evaluate(self, library_indices):
-        """Build the (k, 4) objective matrix for the given library indices.
+        """Build the ``(k, N_OBJECTIVES)`` objective matrix for the given indices.
 
-        ADMET objectives come from the cached library; the docking objective is
-        evaluated on the fly with ``batch_dock``. Failed docks stay NaN.
+        Library objectives (e.g. hERG) come from the cached library; the docking
+        objectives are evaluated on the fly against every target
+        (``DOCKING_TARGETS``). Failed docks stay NaN. Identical to
+        ``loop.BOLoop._evaluate``.
 
         Returns:
-            A tuple ``(Y, docking)`` where ``Y`` has shape ``(k, 4)`` and
-            ``docking`` is the ``(k,)`` docking score vector.
+            A tuple ``(Y, docking_by_target)`` where ``Y`` has shape
+            ``(k, N_OBJECTIVES)`` and ``docking_by_target`` maps each target name
+            to its ``(k,)`` docking-score vector.
         """
         library_indices = list(library_indices)
         smiles = [self.smiles[i] for i in library_indices]
+        admet_rows = self.admet_scores[library_indices]
 
-        docking = batch_dock(smiles)                             # (k,), NaN on fail
+        docking_by_target = batch_dock_targets(smiles, DOCKING_TARGETS)
 
         Y = np.full((len(library_indices), N_OBJECTIVES), np.nan, dtype=np.float64)
-        Y[:, ADMET_COLUMNS] = self.admet_scores[library_indices]
-        Y[:, DOCKING_COLUMN] = docking
-        return Y, docking
+        for j, col in LIBRARY_TASKS:
+            Y[:, j] = admet_rows[:, col]
+        for j, target in DOCKING_TASKS:
+            Y[:, j] = docking_by_target[target]
+        return Y, docking_by_target
 
     # ------------------------------------------------------------------ #
     # Pareto / hypervolume helpers (shared math with loop.BOLoop)
@@ -239,7 +247,7 @@ class GreedyFilterThenDock:
             print(f"\n[Iteration {iteration}] Docking batch of {len(batch)} "
                   f"molecules...")
             Y_new, docking_new = self._evaluate(batch)
-            n_docked = int(np.isfinite(docking_new).sum())
+            batch_docked = docked_summary(docking_new, len(batch))
 
             self.evaluated_indices.extend(batch)
             self.Y_evaluated = np.vstack([self.Y_evaluated, Y_new])
@@ -258,7 +266,7 @@ class GreedyFilterThenDock:
             print(f"[Iteration {iteration}] "
                   f"evaluated={len(self.evaluated_indices)}, "
                   f"batch={len(batch)}, "
-                  f"docked_this_batch={n_docked}/{len(batch)}, "
+                  f"docked_this_batch=[{batch_docked}], "
                   f"pareto_size={pareto_size}, hypervolume={hypervolume:.4f}")
 
         final = self.history[-1] if self.history else {}
@@ -302,20 +310,24 @@ class GreedyFilterThenDock:
         history_path = os.path.join(output_dir, "history.csv")
         history_df.to_csv(history_path, index=False)
 
-        # evaluated.csv — every docked molecule with all 4 objectives.
+        # evaluated.csv — every docked molecule with all objectives + the
+        # reported-only Selectivity Index.
         evaluated_df = pd.DataFrame(
             {"SMILES": [self.smiles[i] for i in self.evaluated_indices]}
         )
         for j, name in enumerate(TASK_NAMES):
             evaluated_df[name] = self.Y_evaluated[:, j]
+        evaluation.add_selectivity_index(evaluated_df)
         evaluated_path = os.path.join(output_dir, "evaluated.csv")
         evaluated_df.to_csv(evaluated_path, index=False)
 
-        # pareto_front.csv — only the Pareto-optimal molecules.
+        # pareto_front.csv — only the Pareto-optimal molecules, with the
+        # Selectivity Index (hDHFR - PfDHFR).
         pareto = self.get_pareto_front()
         pareto_df = pd.DataFrame({"SMILES": pareto["smiles"]})
         for j, name in enumerate(TASK_NAMES):
             pareto_df[name] = pareto["objectives"][:, j]
+        evaluation.add_selectivity_index(pareto_df)
         pareto_path = os.path.join(output_dir, "pareto_front.csv")
         pareto_df.to_csv(pareto_path, index=False)
 

@@ -41,8 +41,8 @@ import pandas as pd
 import gpytorch
 from scipy.stats import norm
 
-from data import load_library
-from mogp import TASK_NAMES
+from data import load_library, ADMET_COLUMNS as LIBRARY_ADMET_COLUMNS
+from mogp import TASK_NAMES, resolve_objective_layout
 from kernel import TanimotoKernel
 from acquisition import (
     compute_pareto_front,
@@ -50,15 +50,21 @@ from acquisition import (
     DEFAULT_OBJECTIVE_SIGNS,
 )
 import evaluation
-from docking import batch_dock
+from docking import batch_dock_targets, docked_summary
 
 
-# Objective layout (matches TASK_NAMES, identical to loop.py). The library
-# supplies the first three (ADMET) columns; docking fills the fourth at
-# evaluation time and is the sole objective the GP optimizes.
+# Objective -> data-source layout (identical to loop.py). All objectives are
+# still recorded (so the multi-objective Pareto / hypervolume is comparable),
+# but the GP optimizes ONE of them: PfDHFR potency alone.
 N_OBJECTIVES = len(TASK_NAMES)
-ADMET_COLUMNS = slice(0, 3)      # Caco2_Permeability, Half_Life, hERG_Toxicity_Prob
-DOCKING_COLUMN = 3               # PfDHFR_Docking
+LIBRARY_TASKS, DOCKING_TASKS, DOCKING_TARGETS = resolve_objective_layout(
+    LIBRARY_ADMET_COLUMNS
+)
+# The single objective this baseline optimizes: parasite-binding potency
+# (PfDHFR_Docking). It deliberately ignores selectivity (hDHFR) and safety
+# (hERG) — the whole point is to show that chasing potency alone yields a worse
+# multi-objective hypervolume.
+POTENCY_COLUMN = TASK_NAMES.index("PfDHFR_Docking")
 
 
 class SingleTaskTanimotoGP(gpytorch.models.ExactGP):

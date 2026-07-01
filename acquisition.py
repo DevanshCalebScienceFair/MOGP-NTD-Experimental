@@ -13,10 +13,9 @@ improvement over the current Pareto front, and average.
 
 The objectives (in ``TASK_NAMES`` order) have mixed directions:
 
-    Caco2_Permeability  -> HIGHER is better (less negative = more permeable)
-    Half_Life           -> HIGHER is better (longer duration)
+    PfDHFR_Docking      -> LOWER is better  (more negative = stronger PARASITE binding)
+    hDHFR_Docking       -> HIGHER is better (less negative = WEAK human binding -> selective)
     hERG_Toxicity_Prob  -> LOWER is better  (less cardiotoxic)
-    PfDHFR_Docking      -> LOWER is better  (more negative = stronger binding)
 
 ``compute_pareto_front`` / ``get_reference_point`` work in ORIGINAL units,
 converting to a maximization frame internally by negating "lower is better"
@@ -28,9 +27,10 @@ acquisition then optimizes exactly the hypervolume that
 ``evaluation.compute_hypervolume`` reports, so an objective with a tiny raw
 range (hERG probability) actually counts in selection, not just in the score.
 
-The number of objectives is dynamic: PfDHFR_Docking is all-NaN until the
-docking module supplies it, so EHVI runs on whichever objective columns
-actually carry data (3 without docking, 4 with it).
+The number of objectives is dynamic: a docking objective is all-NaN until the
+docking oracle supplies it, so EHVI runs on whichever objective columns actually
+carry data (e.g. only hERG before docking, all three once both targets are
+docked).
 """
 
 import numpy as np
@@ -43,8 +43,14 @@ from kernel import TanimotoKernel
 
 
 # Per-objective optimization direction in TASK_NAMES order: +1 = higher better,
-# -1 = lower better. This is the single source of truth for objective signs.
-DEFAULT_OBJECTIVE_SIGNS = [+1, +1, -1, -1]
+# -1 = lower better. This is the single source of truth for objective signs and
+# MUST stay aligned with mogp.TASK_NAMES.
+#   PfDHFR_Docking      -1  (minimize: strong parasite binding)
+#   hDHFR_Docking       +1  (maximize: weak human binding -> selectivity)
+#   hERG_Toxicity_Prob  -1  (minimize: cardiac safety)
+# If the ADMET objectives are re-added to TASK_NAMES, append their signs here in
+# the same order:  Caco2_Permeability +1,  Half_Life +1.
+DEFAULT_OBJECTIVE_SIGNS = [-1, +1, -1]
 
 # Number of posterior samples drawn per candidate for the MC EHVI estimate.
 N_MC_SAMPLES = 128
@@ -323,14 +329,17 @@ if __name__ == "__main__":
     n_train = 10
     train_x = (np.random.rand(n_train, 2048) < 0.05).astype(np.int8)
 
-    # Fake objectives in TASK_NAMES order; docking unavailable (all NaN).
+    # Fake objectives in TASK_NAMES order; the docking objectives are unavailable
+    # (all NaN) until the docking oracle runs, so only the cheap library
+    # objectives (e.g. hERG) carry data here.
+    from mogp import OBJECTIVE_SOURCES
     Y = np.full((n_train, len(TASK_NAMES)), np.nan, dtype=np.float32)
-    Y[:, 0] = np.random.uniform(-6, -4, size=n_train)   # Caco2_Permeability
-    Y[:, 1] = np.random.uniform(1, 100, size=n_train)   # Half_Life
-    Y[:, 2] = np.random.uniform(0, 1, size=n_train)     # hERG_Toxicity_Prob
-    # Y[:, 3] (PfDHFR_Docking) stays NaN.
+    for j, name in enumerate(TASK_NAMES):
+        if OBJECTIVE_SOURCES[name][0] == "library":
+            Y[:, j] = np.random.uniform(0, 1, size=n_train)   # e.g. hERG prob
 
-    print("Training MOGP on 10 fake molecules (3 active objectives)...")
+    n_active = int(sum(OBJECTIVE_SOURCES[n][0] == "library" for n in TASK_NAMES))
+    print(f"Training MOGP on 10 fake molecules ({n_active} active objective(s))...")
     model, likelihood, y_mean, y_std = train_mogp(train_x, Y, n_iterations=50)
 
     # Current Pareto front / reference point over the active objectives.

@@ -20,12 +20,16 @@ The fix (mirroring the ``max_ref_point`` idea in GP-MOBO's hypervolume code): a
 FIXED, shared frame that never depends on evaluated data.
 
     1. Per-objective (min, max) bounds are computed ONCE and persisted
-       (``compute_objective_bounds`` -> ``evaluation_bounds.json``). The three
-       ADMET bounds come from the entire cached library; the docking bound is a
-       fixed configurable range (the library is not docked up front).
+       (``compute_objective_bounds`` -> ``evaluation_bounds.json``). Library
+       (cheap ADMET) objectives get their bounds from the entire cached library;
+       docking objectives get a fixed configurable range (the library is not
+       docked up front). Which objective is which comes from
+       ``mogp.OBJECTIVE_SOURCES`` — nothing is hard-coded to a column position.
     2. ``normalize`` maps every objective into [0, 1] in a pure MAXIMIZATION
        frame using those bounds, flipping lower-is-better objectives so 1.0 is
-       always best.
+       always best. Both docking objectives share the same fixed range, and
+       their opposite preferred directions (PfDHFR strong / hDHFR weak) are
+       handled purely by their signs.
     3. ``FIXED_REFERENCE_POINT`` is the all-zeros corner of that normalized cube
        — the worst possible point on every objective. It never changes, for any
        method or iteration.
@@ -33,8 +37,9 @@ FIXED, shared frame that never depends on evaluated data.
        measures its hypervolume against that fixed reference.
 
 Objective order everywhere is ``mogp.TASK_NAMES``:
-    [Caco2_Permeability, Half_Life, hERG_Toxicity_Prob, PfDHFR_Docking]
-with directions [higher, higher, lower, lower] better.
+    [PfDHFR_Docking, hDHFR_Docking, hERG_Toxicity_Prob]
+with directions [lower, higher, lower] better. ``add_selectivity_index`` adds a
+REPORTED-only Selectivity Index (hDHFR - PfDHFR) that is not a GP objective.
 """
 
 import os
@@ -45,7 +50,7 @@ import torch
 
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 
-from mogp import TASK_NAMES
+from mogp import TASK_NAMES, resolve_objective_layout
 from acquisition import (
     compute_pareto_front,
     get_active_objectives,
@@ -57,15 +62,18 @@ from acquisition import (
 N_OBJECTIVES = len(TASK_NAMES)
 OBJECTIVE_SIGNS = list(DEFAULT_OBJECTIVE_SIGNS)
 
-# Fixed docking range (kcal/mol). Docking is NOT computed over the whole library
-# up front, so its normalization bounds cannot come from data — they are fixed
-# and configurable. Lower (more negative) is a stronger binder. The default span
-# comfortably brackets realistic AutoDock Vina scores for this target.
+# Fixed docking range (kcal/mol), shared by EVERY docking objective (PfDHFR and
+# hDHFR). Docking is NOT computed over the whole library up front, so its
+# normalization bounds cannot come from data — they are fixed and configurable.
+# The span comfortably brackets realistic AutoDock Vina scores. The two docking
+# objectives use the SAME range; their opposite preferred directions (PfDHFR
+# strong = minimize, hDHFR weak = maximize) are handled by their signs in
+# ``normalize``, not by different bounds.
 DOCKING_MIN = -14.0
 DOCKING_MAX = -4.0
 
-# Index of the docking objective within TASK_NAMES.
-DOCKING_INDEX = TASK_NAMES.index("PfDHFR_Docking")
+# Column name of the reported-only Selectivity Index (see add_selectivity_index).
+SELECTIVITY_COLUMN = "Selectivity_Index"
 
 # Where the shared bounds are persisted so every method/run reads identical
 # numbers. Lives next to this module.
@@ -102,21 +110,24 @@ def compute_objective_bounds(library_dir="data/library",
     if not force and os.path.exists(bounds_path):
         return _load_bounds(bounds_path)
 
-    # ADMET bounds from the entire library. The library's admet_scores columns
-    # are in the same order as the first three TASK_NAMES objectives.
-    from data import load_library
+    # Resolve which objectives are library-sourced (bounds from the whole
+    # library) vs docked (fixed range), using OBJECTIVE_SOURCES rather than
+    # assuming "ADMET first, docking last".
+    from data import load_library, ADMET_COLUMNS
 
     library = load_library(library_dir)
-    admet = np.asarray(library["admet_scores"], dtype=float)   # (N, 3)
-    admet_min = admet.min(axis=0)
-    admet_max = admet.max(axis=0)
+    admet = np.asarray(library["admet_scores"], dtype=float)   # (N, n_admet)
+    library_tasks, docking_tasks, _ = resolve_objective_layout(ADMET_COLUMNS)
 
     bounds = np.zeros((N_OBJECTIVES, 2), dtype=float)
-    n_admet = admet.shape[1]
-    bounds[:n_admet, 0] = admet_min
-    bounds[:n_admet, 1] = admet_max
-    bounds[DOCKING_INDEX, 0] = float(docking_min)
-    bounds[DOCKING_INDEX, 1] = float(docking_max)
+    for j, col in library_tasks:
+        bounds[j, 0] = float(admet[:, col].min())
+        bounds[j, 1] = float(admet[:, col].max())
+    for j, _target in docking_tasks:
+        # Every docking objective shares the same fixed range; direction is a
+        # matter of sign, not of bounds.
+        bounds[j, 0] = float(docking_min)
+        bounds[j, 1] = float(docking_max)
 
     _save_bounds(bounds, bounds_path)
     return bounds
@@ -284,6 +295,27 @@ def compute_hypervolume(Y_evaluated, bounds=None):
     return float(hv.compute(pf))
 
 
+# ---------------------------------------------------------------------- #
+# 5. Reported-only Selectivity Index (derived, NOT a GP objective)
+# ---------------------------------------------------------------------- #
+def add_selectivity_index(df):
+    """Add a REPORTED-only Selectivity Index column to a results DataFrame.
+
+    ``Selectivity_Index = hDHFR_Docking - PfDHFR_Docking`` (kcal/mol). Higher is
+    more parasite-selective: it grows when human binding is weak (less negative
+    hDHFR) and parasite binding is strong (more negative PfDHFR). This is a
+    derived, human-facing metric only — it is NOT modeled by any GP and NEVER
+    enters selection or hypervolume; it is computed straight from the two docked
+    values for the Pareto output and the dashboard.
+
+    The column is added only when both docking columns are present (e.g. once
+    both targets are docked). The DataFrame is mutated in place and returned.
+    """
+    if "hDHFR_Docking" in df.columns and "PfDHFR_Docking" in df.columns:
+        df[SELECTIVITY_COLUMN] = df["hDHFR_Docking"] - df["PfDHFR_Docking"]
+    return df
+
+
 if __name__ == "__main__":
     # Build/refresh and display the shared bounds, then a tiny self-check that
     # the same evaluated set yields the same hypervolume regardless of row order
@@ -295,12 +327,14 @@ if __name__ == "__main__":
     print(f"\nFixed reference point (normalized): {FIXED_REFERENCE_POINT}")
 
     rng = np.random.RandomState(0)
-    Y = np.column_stack([
-        rng.uniform(-6, -4, size=8),    # Caco2 (higher better)
-        rng.uniform(1, 100, size=8),    # Half_Life (higher better)
-        rng.uniform(0, 1, size=8),      # hERG (lower better)
-        rng.uniform(-12, -5, size=8),   # docking (lower better)
-    ])
+    from mogp import OBJECTIVE_SOURCES
+    cols = []
+    for name in TASK_NAMES:
+        if OBJECTIVE_SOURCES[name][0] == "dock":
+            cols.append(rng.uniform(-12, -5, size=8))   # docking (kcal/mol)
+        else:
+            cols.append(rng.uniform(0, 1, size=8))      # e.g. hERG probability
+    Y = np.column_stack(cols)
     hv_a = compute_hypervolume(Y)
     hv_b = compute_hypervolume(Y[::-1])          # same set, shuffled rows
     print(f"\nHypervolume: {hv_a:.6f}  (row-reversed: {hv_b:.6f})")
