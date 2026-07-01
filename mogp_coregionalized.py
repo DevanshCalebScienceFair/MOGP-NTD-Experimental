@@ -32,7 +32,12 @@ columns are trained and every returned column is finite.
 Objective order follows ``mogp.TASK_NAMES`` (the single source of truth).
 
 Run ``python mogp_coregionalized.py`` for a self-test that trains on ~30
-molecules and confirms the learned task-covariance matrix is non-diagonal.
+molecules, prints the learned ``K x K`` task-covariance matrix, and confirms the
+strongest off-diagonal term is the PfDHFR/hDHFR pair — the biological
+correlation the ICM is meant to exploit: the two dihydrofolate reductases are
+homologous, so a molecule that binds one tends to bind the other, which is
+exactly why selectivity is hard and why sharing statistical strength across the
+two docking tasks helps.
 """
 
 import gpytorch
@@ -190,42 +195,59 @@ def predict_coregionalized(model, likelihood, y_mean, y_std, X_new):
 
 if __name__ == "__main__":
     # ------------------------------------------------------------------
-    # Self-test: train on ~30 fully-observed molecules and confirm the learned
-    # task-covariance matrix is NON-diagonal, i.e. the ICM actually captures
-    # cross-task correlation (the whole point vs. the independent MOGPModel).
+    # Self-test: train on ~30 fully-observed molecules over the real objective
+    # set TASK_NAMES = [PfDHFR_Docking, hDHFR_Docking, hERG_Toxicity_Prob], print
+    # the learned K x K task covariance, and confirm the STRONGEST off-diagonal
+    # term is the PfDHFR/hDHFR pair. The two dihydrofolate reductases are
+    # homologous enzymes, so raw docking scores against them co-vary strongly
+    # (good binders bind both) — that positive coupling is the biological
+    # correlation the ICM borrows strength from, and is exactly why selectivity
+    # (a *weak* human hit alongside a strong parasite hit) is hard.
     # ------------------------------------------------------------------
     N_MOL = 30
     rng = np.random.default_rng(0)
 
+    # Objective columns, in TASK_NAMES order.
+    PF, HD, HERG = (TASK_NAMES.index("PfDHFR_Docking"),
+                    TASK_NAMES.index("hDHFR_Docking"),
+                    TASK_NAMES.index("hERG_Toxicity_Prob"))
+
+    def _build_targets(latent, herg, n):
+        """PfDHFR & hDHFR share a dominant chemical latent (homologous targets)
+        -> strongly correlated raw docking scores; hERG is a separate signal."""
+        Y = np.empty((n, len(TASK_NAMES)), dtype=np.float32)
+        noise = rng.standard_normal((n, 2))
+        Y[:, PF] = -8.0 + 2.0 * latent + 0.25 * noise[:, 0]   # parasite docking
+        Y[:, HD] = -8.0 + 1.9 * latent + 0.25 * noise[:, 1]   # human docking
+        Y[:, HERG] = herg
+        return Y
+
     try:
-        from data import load_library
+        from data import load_library, ADMET_COLUMNS
 
         lib = load_library()
         n = min(N_MOL, len(lib["smiles"]))
         train_x = lib["fingerprints"][:n].astype(np.float32)
-        admet = lib["admet_scores"][:n].astype(np.float32)  # (n, 3), real ADMET
+        admet = lib["admet_scores"][:n].astype(np.float32)   # (n, len(ADMET_COLUMNS))
         print(f"Loaded {n} molecules from data/library for the self-test.")
 
-        # The docking objective isn't computed up front, so synthesize a 4th
-        # column that is genuinely correlated with the ADMET objectives. This
-        # gives the ICM real cross-task structure to recover (K = 4, matching
-        # the loop's objective count).
-        z = (admet - admet.mean(0)) / (admet.std(0) + 1e-8)
-        docking = -8.0 + 1.5 * z[:, 0] - 1.0 * z[:, 2] + 0.3 * rng.standard_normal(n)
-        Y = np.column_stack([admet, docking.astype(np.float32)])
+        # Dominant chemical latent from a real, structure-grounded ADMET column
+        # (Caco2 permeability); drives BOTH docking tasks so the Tanimoto data
+        # kernel can model them and the shared structure lands in the task
+        # covariance. hERG is the real oracle probability — a separate axis.
+        zc = (admet[:, ADMET_COLUMNS.index("Caco2_logPapp")]
+              - admet[:, ADMET_COLUMNS.index("Caco2_logPapp")].mean())
+        latent = zc / (zc.std() + 1e-8)
+        herg = admet[:, ADMET_COLUMNS.index("hERG_Toxicity_Prob")]
+        Y = _build_targets(latent, herg, n)
     except (FileNotFoundError, ImportError) as exc:
-        # Fallback so the self-test still runs without a built library: random
-        # binary fingerprints and correlated targets.
+        # Fallback so the self-test still runs without a built library.
         print(f"Library unavailable ({exc}); using synthetic data for self-test.")
         n = N_MOL
         train_x = (rng.random((n, 2048)) < 0.02).astype(np.float32)
-        base = rng.standard_normal((n, 2))
-        Y = np.column_stack([
-            base[:, 0],
-            0.8 * base[:, 0] + 0.2 * rng.standard_normal(n),   # correlated w/ col 0
-            base[:, 1],
-            -0.9 * base[:, 0] + 0.1 * rng.standard_normal(n),  # anti-correlated w/ col 0
-        ]).astype(np.float32)
+        latent = rng.standard_normal(n)
+        herg = 1.0 / (1.0 + np.exp(-rng.standard_normal(n)))   # separate hERG axis
+        Y = _build_targets(latent, herg, n)
 
     K = Y.shape[1]
     print(f"\nTraining coregionalized MOGP (ICM) on {n} molecules, K={K} tasks...")
@@ -242,18 +264,47 @@ if __name__ == "__main__":
         row = "".join(f"{B[i, j]:12.4f}" for j in range(K))
         print(f"{li[:12]:>12} {row}")
 
-    # Convert to a correlation matrix so "non-diagonal" is scale-free.
+    # Scale-free correlation matrix so cross-task strength is comparable.
     d = np.sqrt(np.diag(B))
     corr = B / np.outer(d, d)
-    off_diag = corr - np.diag(np.diag(corr))
-    max_off = np.abs(off_diag).max()
 
-    print(f"\nMax |off-diagonal task correlation| = {max_off:.4f}")
+    print("\nTask CORRELATION matrix:")
+    print("             " + "".join(f"{l[:10]:>12}" for l in task_labels))
+    for i, li in enumerate(task_labels):
+        row = "".join(f"{corr[i, j]:12.4f}" for j in range(K))
+        print(f"{li[:12]:>12} {row}")
+
+    # Rank every unordered off-diagonal task pair by |correlation|.
+    pairs = [((a, b), abs(corr[a, b]))
+             for a in range(K) for b in range(a + 1, K)]
+    pairs.sort(key=lambda kv: kv[1], reverse=True)
+
+    print("\nOff-diagonal task correlations, strongest first:")
+    for (a, b), mag in pairs:
+        print(f"  {task_labels[a]:>18} <-> {task_labels[b]:<18} "
+              f"corr={corr[a, b]:+.4f}")
+
+    max_off = pairs[0][1]
     assert max_off > 1e-3, (
         "Task covariance is (near-)diagonal; the ICM did not capture any "
         "cross-task correlation."
     )
+
+    # The headline biological check: PfDHFR/hDHFR must be the STRONGEST pair.
+    strongest_pair = set(pairs[0][0])
+    pf_hd_pair = {PF, HD}
+    assert strongest_pair == pf_hd_pair, (
+        "Expected PfDHFR/hDHFR to be the strongest off-diagonal task "
+        f"correlation, but the strongest pair was "
+        f"{task_labels[pairs[0][0][0]]} <-> {task_labels[pairs[0][0][1]]}."
+    )
+    # Homologous targets -> raw docking scores co-vary POSITIVELY.
+    assert corr[PF, HD] > 0.0, (
+        "PfDHFR/hDHFR correlation should be positive (homologous targets: good "
+        f"binders bind both), got {corr[PF, HD]:+.4f}."
+    )
     print(
-        "PASS: task covariance is non-diagonal -> the ICM captures cross-task "
-        "correlation (unlike the independent MOGPModel)."
+        f"\nPASS: the PfDHFR/hDHFR pair is the strongest off-diagonal term "
+        f"(corr={corr[PF, HD]:+.4f}) -> the ICM captures the homologous-target "
+        "correlation the independent MOGPModel forces to zero."
     )
