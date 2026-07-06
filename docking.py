@@ -50,6 +50,13 @@ from rdkit import Chem
 from rdkit.Chem import AllChem
 import meeko
 
+from docking_cache import (
+    DockingCache,
+    canonicalize_smiles,
+    STATUS_OK,
+    STATUS_FAIL,
+)
+
 
 # ---------------------------------------------------------------------- #
 # Docking targets. Each is a rigid receptor prepared from an RCSB PDB, with a
@@ -80,6 +87,46 @@ TARGETS = {
 
 # Default target for the backward-compatible dock()/batch_dock() helpers.
 DEFAULT_TARGET = "PfDHFR"
+
+# Explicit Vina random seed. The RDKit conformer is already seeded (0xF00D in
+# prepare_ligand); seeding Vina too makes the whole docking oracle deterministic
+# — the same (SMILES, target) yields the same affinity every run. That is what
+# makes the persistent docking cache below sound.
+DEFAULT_VINA_SEED = 42
+
+# ---------------------------------------------------------------------- #
+# Persistent docking cache. Keyed by (canonical SMILES, target); shared across
+# every method and seed so overlapping library molecks are docked at most once.
+# Lazily constructed so importing this module never touches the filesystem, and
+# globally toggleable for the --no-cache escape hatch.
+# ---------------------------------------------------------------------- #
+_CACHE = None
+_CACHE_ENABLED = True
+
+
+def get_cache():
+    """Return the process-wide DockingCache, constructing it on first use."""
+    global _CACHE
+    if _CACHE is None:
+        _CACHE = DockingCache()
+    return _CACHE
+
+
+def set_cache_enabled(enabled):
+    """Enable/disable cache reads+writes globally (the --no-cache escape hatch).
+
+    When disabled, ``dock_target`` neither consults nor writes the cache, so
+    every molecule is docked afresh. Returns the previous setting.
+    """
+    global _CACHE_ENABLED
+    previous = _CACHE_ENABLED
+    _CACHE_ENABLED = bool(enabled)
+    return previous
+
+
+def clear_cache():
+    """Drop every cached dock (the --clear-cache escape hatch / failure retry)."""
+    get_cache().clear()
 
 
 def _target_spec(target):
@@ -327,7 +374,8 @@ def _parse_best_affinity(stdout):
     return min(affinities)
 
 
-def dock_target(smiles, target=DEFAULT_TARGET, n_poses=9):
+def dock_target(smiles, target=DEFAULT_TARGET, n_poses=9,
+                seed=DEFAULT_VINA_SEED, use_cache=True):
     """Dock a single molecule into a NAMED target's active site; return the score.
 
     Runs the full pipeline (download -> clean protein -> prepare ligand ->
@@ -336,17 +384,39 @@ def dock_target(smiles, target=DEFAULT_TARGET, n_poses=9):
     ``subprocess`` (the ``vina`` Python package does not build on Apple
     Silicon), and the affinity is parsed from its stdout table.
 
+    The docking oracle is deterministic: ``prepare_ligand`` seeds the RDKit
+    conformer and ``seed`` is passed to Vina, so a given ``(SMILES, target)``
+    always scores the same. That determinism is what lets the on-disk cache
+    (keyed by canonical SMILES + target) short-circuit repeat docks.
+
     Args:
         smiles: The ligand SMILES string.
         target: A key of ``TARGETS`` (default ``"PfDHFR"``). Its binding box
             (center + size) is taken from the registry.
         n_poses: Number of poses for Vina to generate (default 9).
+        seed: Explicit Vina random seed (default ``DEFAULT_VINA_SEED``).
+        use_cache: If True (and the cache is globally enabled), read/write the
+            persistent docking cache. Set False to force a fresh dock.
 
     Returns:
         The best binding affinity as a float (kcal/mol, more negative = stronger
         binding), or ``None`` if docking fails for any reason (warning printed).
+        A cached failure returns ``None`` without re-docking (clear the cache to
+        retry it).
     """
     spec = _target_spec(target)
+
+    # --- Cache lookup (canonical SMILES + target key) ---
+    caching = use_cache and _CACHE_ENABLED
+    canonical = canonicalize_smiles(smiles) if caching else None
+    if caching:
+        cached = get_cache().get(canonical, target)
+        if cached is not None:
+            status, affinity = cached
+            # A cached failure is returned as-is (None); clearing the cache is
+            # the way to retry it. A cached success returns the stored affinity.
+            return affinity if status == STATUS_OK else None
+
     ligand_pdbqt = None
     out_pdbqt = None
     try:
@@ -379,15 +449,25 @@ def dock_target(smiles, target=DEFAULT_TARGET, n_poses=9):
             "--size_z", str(sz),
             "--exhaustiveness", "8",
             "--num_modes", str(n_poses),
+            # Explicit seed -> reproducible poses/scores across runs.
+            "--seed", str(seed),
             "--out", out_pdbqt,
         ]
         # check=True turns a non-zero Vina exit into CalledProcessError, which is
         # caught below and reported as a docking failure.
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
 
-        return _parse_best_affinity(result.stdout)
+        affinity = _parse_best_affinity(result.stdout)
+        if caching:
+            get_cache().put(canonical, target, float(affinity), STATUS_OK, seed=seed)
+        return affinity
     except Exception as exc:
         warnings.warn(f"Docking failed for SMILES {smiles!r} against {target}: {exc}")
+        if caching:
+            # Record the failure (marked, affinity NULL) so we don't keep
+            # re-attempting a molecule that reliably fails; clear the cache to
+            # retry it.
+            get_cache().put(canonical, target, None, STATUS_FAIL, seed=seed)
         return None
     finally:
         for path in (ligand_pdbqt, out_pdbqt):
@@ -395,7 +475,8 @@ def dock_target(smiles, target=DEFAULT_TARGET, n_poses=9):
                 os.remove(path)
 
 
-def batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=1):
+def batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=1,
+                      seed=DEFAULT_VINA_SEED, use_cache=True):
     """Dock a list of molecules against ONE named target, returning affinities.
 
     Args:
@@ -403,6 +484,8 @@ def batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=1):
         target: A key of ``TARGETS`` (default ``"PfDHFR"``).
         n_jobs: Reserved for future parallelism. Only ``n_jobs=1`` (sequential)
             is implemented for now.
+        seed: Explicit Vina seed threaded to ``dock_target``.
+        use_cache: Whether to use the persistent docking cache.
 
     Returns:
         A numpy array of shape ``(N,)`` and dtype ``float64`` aligned to the
@@ -415,19 +498,22 @@ def batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=1):
 
     for i, smiles in enumerate(smiles_list):
         print(f"Docking molecule {i + 1}/{n} against {target}...")
-        result = dock_target(smiles, target=target)
+        result = dock_target(smiles, target=target, seed=seed, use_cache=use_cache)
         if result is not None:
             scores[i] = result
 
     return scores
 
 
-def batch_dock_targets(smiles_list, targets):
+def batch_dock_targets(smiles_list, targets, seed=DEFAULT_VINA_SEED,
+                       use_cache=True):
     """Dock a list of molecules against SEVERAL named targets.
 
     Args:
         smiles_list: An iterable of SMILES strings.
         targets: Iterable of target names (keys of ``TARGETS``).
+        seed: Explicit Vina seed threaded to each dock.
+        use_cache: Whether to use the persistent docking cache.
 
     Returns:
         A dict ``{target_name: np.ndarray shape (N,)}`` of affinities, each
@@ -435,7 +521,10 @@ def batch_dock_targets(smiles_list, targets):
         with the number of targets — two targets ~doubles the cost, as expected.
     """
     smiles_list = list(smiles_list)
-    return {t: batch_dock_target(smiles_list, target=t) for t in targets}
+    return {
+        t: batch_dock_target(smiles_list, target=t, seed=seed, use_cache=use_cache)
+        for t in targets
+    }
 
 
 def docked_summary(docking_by_target, n):
@@ -453,17 +542,42 @@ def docked_summary(docking_by_target, n):
 # ------------------------------------------------------------------ #
 # Backward-compatible single-target (PfDHFR) helpers.
 # ------------------------------------------------------------------ #
-def dock(smiles, n_poses=9):
+def dock(smiles, n_poses=9, seed=DEFAULT_VINA_SEED, use_cache=True):
     """Dock a single molecule against the default target (PfDHFR). See dock_target."""
-    return dock_target(smiles, target=DEFAULT_TARGET, n_poses=n_poses)
+    return dock_target(smiles, target=DEFAULT_TARGET, n_poses=n_poses,
+                       seed=seed, use_cache=use_cache)
 
 
-def batch_dock(smiles_list, n_jobs=1):
+def batch_dock(smiles_list, n_jobs=1, seed=DEFAULT_VINA_SEED, use_cache=True):
     """Dock a list against the default target (PfDHFR). See batch_dock_target."""
-    return batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=n_jobs)
+    return batch_dock_target(smiles_list, target=DEFAULT_TARGET, n_jobs=n_jobs,
+                             seed=seed, use_cache=use_cache)
 
 
 if __name__ == "__main__":
+    import argparse
+
+    parser = argparse.ArgumentParser(
+        description="Validate the DHFR docking oracle (and cache) on a few "
+                    "reference molecules."
+    )
+    parser.add_argument(
+        "--no-cache", action="store_true",
+        help="Dock every molecule fresh; do not read or write the docking cache.",
+    )
+    parser.add_argument(
+        "--clear-cache", action="store_true",
+        help="Wipe the persistent docking cache before running (retries failures).",
+    )
+    args = parser.parse_args()
+
+    if args.clear_cache:
+        clear_cache()
+        print("Cleared the docking cache.")
+    if args.no_cache:
+        set_cache_enabled(False)
+        print("Docking cache disabled (--no-cache).")
+
     # Validation set: an antimalarial that engages PfDHFR, an unrelated drug, and
     # a negative control. Pyrimethamine is a textbook PfDHFR inhibitor, so a
     # correctly centered PfDHFR box must score it strongly. We also dock every
