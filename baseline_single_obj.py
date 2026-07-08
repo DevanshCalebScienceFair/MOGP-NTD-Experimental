@@ -45,7 +45,13 @@ import pandas as pd
 import gpytorch
 from scipy.stats import norm
 
-from data import load_library, ADMET_COLUMNS as LIBRARY_ADMET_COLUMNS
+from data import (
+    load_library,
+    ADMET_COLUMNS as LIBRARY_ADMET_COLUMNS,
+    heavy_atom_stats,
+    pareto_heavy_summary,
+    FRAGMENT_MEDIAN_WARN,
+)
 from mogp import TASK_NAMES, resolve_objective_layout
 from kernel import TanimotoKernel
 from acquisition import (
@@ -463,15 +469,21 @@ class SingleObjectiveBOLoop:
         self.Y_evaluated = np.vstack([self.Y_evaluated, Y_new])
         self.raw_docking = np.vstack([self.raw_docking, Y_raw_new])
 
-        # --- Track Pareto front + hypervolume (across ALL 5 objectives) ---
-        pareto_size = int(self._pareto_mask().sum())
+        # --- Track Pareto front + hypervolume + size-drift monitor ---
+        pareto_mask = self._pareto_mask()
+        pareto_size = int(pareto_mask.sum())
         hypervolume = self._hypervolume()
+        pareto_rows = np.where(pareto_mask)[0]
+        pareto_smiles = [self.smiles[self.evaluated_indices[r]] for r in pareto_rows]
+        pareto_median_heavy, pareto_min_heavy = heavy_atom_stats(pareto_smiles)
 
         self.history.append({
             "iteration": iteration,
             "n_evaluated": len(self.evaluated_indices),
             "pareto_size": pareto_size,
             "hypervolume": hypervolume,
+            "pareto_median_heavy": pareto_median_heavy,
+            "pareto_min_heavy": pareto_min_heavy,
             "batch_indices": [int(i) for i in selected_library_indices],
             "batch_ei_scores": [float(s) for s in selected_ei],
         })
@@ -480,7 +492,8 @@ class SingleObjectiveBOLoop:
               f"evaluated={len(self.evaluated_indices)}, "
               f"batch={len(selected_library_indices)}, "
               f"docked_this_batch=[{batch_docked}], "
-              f"pareto_size={pareto_size}, hypervolume={hypervolume:.4f}")
+              f"pareto_size={pareto_size}, hypervolume={hypervolume:.4f}, "
+              f"pareto_median_heavy={pareto_median_heavy:.0f}")
         return True
 
     def run(self):
@@ -495,6 +508,12 @@ class SingleObjectiveBOLoop:
         print(f"  Total molecules evaluated: {len(self.evaluated_indices)}")
         print(f"  Final Pareto front size:   {final.get('pareto_size', 0)}")
         print(f"  Final hypervolume:         {final.get('hypervolume', 0.0):.4f}")
+        # Size-drift summary (same monitor as the MOGP loop, for fair comparison).
+        line, med, flagged = pareto_heavy_summary(self.get_pareto_front()["smiles"])
+        print(f"  {line}")
+        if flagged:
+            print(f"  WARNING: Pareto median heavy-atom count {med:.0f} < "
+                  f"{FRAGMENT_MEDIAN_WARN} — front drifting toward FRAGMENTS.")
         return self.history
 
     # ------------------------------------------------------------------ #
@@ -526,6 +545,8 @@ class SingleObjectiveBOLoop:
                 "n_evaluated": h["n_evaluated"],
                 "pareto_size": h["pareto_size"],
                 "hypervolume": h["hypervolume"],
+                "pareto_median_heavy": h.get("pareto_median_heavy", float("nan")),
+                "pareto_min_heavy": h.get("pareto_min_heavy", float("nan")),
             }
             for h in self.history
         ])

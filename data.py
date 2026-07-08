@@ -43,6 +43,23 @@ from admet_oracle import ADMETOracle
 # constant so build_library and load_library cannot drift out of sync.
 ADMET_COLUMNS = ["Caco2_logPapp", "Half_Life_hours", "hERG_Toxicity_Prob"]
 
+# Fragment ceiling for the SHARED candidate library. The optimized docking
+# objective is ligand efficiency (raw docking / heavy-atom count), which
+# mechanically rewards SMALL molecules, so without a floor the Pareto front can
+# drift into fragments over a full run. `load_library` drops every molecule below
+# this many heavy atoms ONCE, in the shared load path, so the MOGP loop and all
+# baselines see the SAME floored library (never filtered per-method).
+#
+# This is a principled drug-likeness floor, NOT a tunable knob: it is set safely
+# below the smallest known clinical antifolate (Pyrimethamine/Cycloguanil, 17
+# heavy atoms), and `load_library` ASSERTS that no KNOWN_ACTIVE is ever excluded.
+HEAVY_ATOM_FLOOR = 14
+
+# Pareto size-drift warning threshold (one above the floor): if a run's final
+# Pareto median heavy-atom count slips below this, the front is approaching the
+# fragment floor and the LE objective may be over-corrected toward tiny molecules.
+FRAGMENT_MEDIAN_WARN = HEAVY_ATOM_FLOOR + 1
+
 # The flag columns the ADMET oracle emits alongside its predictions; a molecule
 # is dropped from the library if ANY of these is True (see process_smiles).
 ADMET_FLAG_COLUMNS = [
@@ -274,12 +291,126 @@ def build_library(n_molecules=10000, output_dir="data/library"):
     return output_dir
 
 
-def load_library(library_dir="data/library"):
-    """Load the cached molecule library from disk.
+def heavy_atom_count(smiles):
+    """Heavy-atom count for a SMILES, or None if RDKit cannot parse it.
+
+    ``Chem.MolFromSmiles(smiles).GetNumHeavyAtoms()`` — the SAME definition
+    ``docking.raw_to_ligand_efficiency`` uses for the LE denominator and
+    ``validate_docking.py`` uses for its diagnostics, so heavy-atom counts are
+    consistent across the floor, the objective, and the size-drift monitor.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    return None if mol is None else int(mol.GetNumHeavyAtoms())
+
+
+def heavy_atom_stats(smiles_list):
+    """Return ``(median, min)`` heavy-atom count over a list of SMILES.
+
+    Unparseable SMILES are skipped; ``(nan, nan)`` if none parse (e.g. an empty
+    Pareto front). Used as the per-iteration size-drift monitor in the loop and
+    baselines.
+    """
+    counts = [c for c in (heavy_atom_count(s) for s in smiles_list) if c is not None]
+    if not counts:
+        return float("nan"), float("nan")
+    return float(np.median(counts)), float(np.min(counts))
+
+
+def pareto_heavy_summary(smiles_list, warn_below=FRAGMENT_MEDIAN_WARN):
+    """Summarize a Pareto front's heavy-atom distribution and flag fragment drift.
+
+    Returns ``(summary_line, median, flagged)``. With the LE objective rewarding
+    small molecules, a front whose MEDIAN heavy-atom count slips below
+    ``warn_below`` is approaching the fragment floor; ``flagged`` is True then.
+    """
+    counts = [c for c in (heavy_atom_count(s) for s in smiles_list) if c is not None]
+    if not counts:
+        return "Final Pareto heavy atoms: (empty front)", float("nan"), False
+    arr = np.asarray(counts)
+    med = float(np.median(arr))
+    line = (f"Final Pareto heavy atoms: n={arr.size}, min {int(arr.min())}, "
+            f"median {med:.0f}, max {int(arr.max())}; "
+            f"{int((arr < warn_below).sum())} below {warn_below}")
+    return line, med, med < warn_below
+
+
+def _assert_known_actives_survive_floor(floor):
+    """Assert none of the four KNOWN_ACTIVES would be excluded by ``floor``.
+
+    The heavy-atom floor is a principled drug-likeness ceiling, not a knob to tune
+    results, so it must NEVER cut a real clinical antifolate (smallest = 17 heavy
+    atoms). Fails loudly if the floor is ever raised past one. Imported lazily so
+    ``data`` carries no import-time dependency on the validation script.
+    """
+    from validate_known_actives import KNOWN_ACTIVES
+
+    counts = {a["name"]: heavy_atom_count(a["smiles"]) for a in KNOWN_ACTIVES}
+    cut = {name: hc for name, hc in counts.items() if hc is None or hc < floor}
+    smallest = min(hc for hc in counts.values() if hc is not None)
+    assert not cut, (
+        f"Heavy-atom floor {floor} would EXCLUDE known clinical antifolate(s) "
+        f"{cut} (heavy-atom counts {counts}). The floor is a principled "
+        f"drug-likeness ceiling below the smallest known active ({smallest} heavy "
+        "atoms), NOT a tunable knob — lower it; do not exclude a real drug."
+    )
+    return counts, smallest
+
+
+def _apply_heavy_atom_floor(smiles, fingerprints, admet_scores, floor):
+    """Filter the cached library to molecules with >= ``floor`` heavy atoms.
+
+    Applied ONCE in ``load_library`` so every method sees the same floored library.
+    Operates on the EXISTING cached arrays (no ChEMBL rebuild) and never touches
+    the docking cache — the cache is keyed by SMILES, so removed molecules are
+    simply never queried and every cached score stays valid. The three arrays are
+    filtered by one shared mask, so they stay row-aligned.
+    """
+    counts, smallest = _assert_known_actives_survive_floor(floor)
+
+    keep = np.zeros(len(smiles), dtype=bool)
+    kept_heavy, kept_mw = [], []
+    for i, s in enumerate(smiles):
+        mol = Chem.MolFromSmiles(s)
+        if mol is None:
+            continue                       # unparseable -> drop (defensive)
+        h = mol.GetNumHeavyAtoms()
+        if h >= floor:
+            keep[i] = True
+            kept_heavy.append(h)
+            kept_mw.append(float(Descriptors.MolWt(mol)))
+
+    n_before, n_after = len(smiles), int(keep.sum())
+    kept_smiles = [s for s, k in zip(smiles, keep) if k]
+    if kept_heavy:
+        kh, km = np.asarray(kept_heavy), np.asarray(kept_mw)
+        ranges = (f"surviving heavy atoms [{int(kh.min())}, {int(kh.max())}], "
+                  f"MW [{km.min():.1f}, {km.max():.1f}]")
+    else:
+        ranges = "no survivors"
+    print(f"load_library: heavy-atom floor >= {floor}: {n_after}/{n_before} "
+          f"molecules survive ({n_before - n_after} fragment(s) removed); {ranges}. "
+          f"Known actives retained (smallest {smallest} heavy atoms).")
+
+    return kept_smiles, fingerprints[keep], admet_scores[keep]
+
+
+def load_library(library_dir="data/library", heavy_atom_floor=HEAVY_ATOM_FLOOR):
+    """Load the cached molecule library from disk, applying the shared size floor.
+
+    A drug-likeness heavy-atom floor (``heavy_atom_floor``, default
+    ``HEAVY_ATOM_FLOOR`` = 14) is applied ONCE here, in the shared load path, so
+    the MOGP loop and every baseline see the SAME floored candidate library (never
+    filtered per-method). Filtering runs on the EXISTING cached files — it does
+    NOT rebuild from ChEMBL and does NOT touch the docking cache (keyed by SMILES;
+    removed molecules are simply never docked). Pass ``heavy_atom_floor=None`` to
+    load the raw cached library unfiltered.
 
     Args:
         library_dir: Directory containing smiles.csv, fingerprints.npy, and
             admet_scores.csv.
+        heavy_atom_floor: Minimum heavy-atom count to keep; ``None``/0 disables
+            the floor. Asserts no KNOWN_ACTIVE is excluded (see
+            ``_assert_known_actives_survive_floor``).
 
     Returns:
         A dict with keys:
@@ -287,6 +418,7 @@ def load_library(library_dir="data/library"):
             "fingerprints": np.ndarray shape (N, 2048) int8
             "admet_scores": np.ndarray shape (N, 3) float32, columns in order
                             [Caco2_logPapp, Half_Life_hours, hERG_Toxicity_Prob]
+        with the three arrays row-aligned after the floor.
 
     Raises:
         FileNotFoundError: If any of the three library files is missing.
@@ -306,6 +438,12 @@ def load_library(library_dir="data/library"):
     fingerprints = np.load(fingerprints_path).astype(np.int8)
     admet_df = pd.read_csv(admet_path)
     admet_scores = admet_df[ADMET_COLUMNS].to_numpy(dtype=np.float32)
+
+    # Shared, once-only fragment floor (fair across every method).
+    if heavy_atom_floor:
+        smiles, fingerprints, admet_scores = _apply_heavy_atom_floor(
+            smiles, fingerprints, admet_scores, heavy_atom_floor
+        )
 
     return {
         "smiles": smiles,
