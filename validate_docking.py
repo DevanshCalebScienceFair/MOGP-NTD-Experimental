@@ -16,16 +16,18 @@ reader can decide in ~30 seconds whether the docking signal is trustworthy:
   2. A PfDHFR docking-score sample, preferring molecules already docked (existing
      run outputs, then the persistent docking cache) and only docking fresh to
      top up to --n-sample. The provenance breakdown is printed.
-  3. Pearson AND Spearman correlation of docking score vs MW and vs logP, with a
-     plain-language verdict (|r| > ~0.5 -> the objective is partly a size/lipo
-     artifact, flagged explicitly).
+  3. Pearson AND Spearman of MW/logP against BOTH raw docking AND ligand
+     efficiency (LE = docking / heavy_atoms), printed side by side so the drop is
+     visible at a glance. LE targets SIZE directly and lipophilicity only partly,
+     so a residual LE-vs-logP correlation (|r| > ~0.3) is flagged as needing a
+     lipophilicity-aware escalation (LLE) rather than declaring victory.
   4. Ligand efficiency (docking score / heavy-atom count) — the standard
      size-debiased view — and how much re-ranking by LE changes the top molecules
      vs the raw score (a remedy, not just a diagnosis).
   5. The four KNOWN_ACTIVES (clinical antifolates, reused from
      validate_known_actives) docked against PfDHFR, each reported as a percentile
-     within the library docking distribution: do real drugs land among the good
-     scores, or do library "winners" dock dramatically better than real drugs?
+     within the library distribution under BOTH raw docking and LE: do real drugs
+     rise once size is corrected, or does LE over-correct into tiny fragments?
 
 It imports the pipeline's own docking / library code but MODIFIES NOTHING; it is
 a read-only observer that uses the docking cache like every other entry point.
@@ -69,6 +71,12 @@ DEFAULT_RESULTS_DIRS = [
 # Correlation strength thresholds for the plain-language verdict.
 CORR_STRONG = 0.5
 CORR_MODERATE = 0.3
+
+# Below this heavy-atom count an "efficient" LE winner is really a fragment. LE
+# (= docking / heavy_atoms) mechanically rewards tiny molecules, so if the LE-top
+# set is dominated by sub-fragment-sized molecules, LE is OVER-correcting size
+# rather than debiasing it — the opposite failure mode to a raw size confound.
+FRAGMENT_HEAVY_ATOMS = 15
 
 
 # ---------------------------------------------------------------------- #
@@ -265,14 +273,18 @@ def _strength_word(r):
 
 
 def report_correlations(sample_df):
-    """Print Pearson + Spearman of docking vs MW and vs logP, with a verdict.
+    """Print Pearson + Spearman of MW/logP against RAW docking AND ligand efficiency.
 
-    Returns ``{"MW": (pearson, spearman), "logP": (pearson, spearman)}`` and a
-    boolean ``flagged`` (any |r| > CORR_STRONG), so the caller can fold it into
-    the final summary.
+    The RAW docking block is the original diagnostic (unchanged); the LIGAND
+    EFFICIENCY (LE = docking / heavy_atoms) block follows immediately so the
+    size/lipophilicity confound before vs after the correction sits side by side.
+
+    Returns ``(corrs, raw_flagged)`` where ``corrs`` is
+    ``{"MW": {"raw": (p, s), "le": (p, s)}, "logP": {...}}`` and ``raw_flagged``
+    is True if any RAW |r| > CORR_STRONG.
     """
     print("\n" + "=" * 78)
-    print("3. DOCKING vs SIZE / LIPOPHILICITY  (Pearson + Spearman)")
+    print("3. SIZE / LIPOPHILICITY CONFOUND — RAW docking vs LIGAND EFFICIENCY")
     print("=" * 78)
 
     y = sample_df["docking"].to_numpy()
@@ -287,13 +299,14 @@ def report_correlations(sample_df):
     print(f"  A negative r means BIGGER / GREASIER molecules get 'better' "
           "(more negative) scores.\n")
 
+    # --- RAW docking (the original objective) — output preserved verbatim ---
     out = {}
     flagged = False
     for col in ("MW", "logP"):
         x = sample_df[col].to_numpy()
         pear = float(pearsonr(x, y)[0])
         spear = float(spearmanr(x, y)[0])
-        out[col] = (pear, spear)
+        out[col] = {"raw": (pear, spear)}
         strong = abs(pear) > CORR_STRONG or abs(spear) > CORR_STRONG
         flagged = flagged or strong
         label = "docking vs " + col
@@ -304,6 +317,40 @@ def report_correlations(sample_df):
                   f"{col} (|r| > {CORR_STRONG}), not binding alone.")
         else:
             print(f"      -> ok: no strong {col} dependence (|r| <= {CORR_STRONG}).")
+
+    # --- LIGAND EFFICIENCY (the size-corrected objective we switched to) ---
+    le = (sample_df["docking"] / sample_df["heavy_atoms"]).to_numpy()
+    print("\n  Now the SAME descriptors vs LIGAND EFFICIENCY "
+          "(LE = docking / heavy_atoms):")
+    print("  The fix works if LE's |r| vs MW drops toward 0 — size no longer "
+          "buys score.")
+    for col in ("MW", "logP"):
+        x = sample_df[col].to_numpy()
+        lp = float(pearsonr(x, le)[0])
+        ls = float(spearmanr(x, le)[0])
+        out[col]["le"] = (lp, ls)
+        raw_abs = abs(out[col]["raw"][0])
+        label = "LE vs " + col
+        print(f"  {label:<16} Pearson r = {lp:+.3f} ({_strength_word(lp)}), "
+              f"Spearman rho = {ls:+.3f} ({_strength_word(ls)})"
+              f"   [raw |r|={raw_abs:.2f} -> LE |r|={abs(lp):.2f}]")
+        if col == "MW":
+            if abs(lp) > CORR_STRONG:
+                print("      -> SIZE OVER-SWING: LE now tracks MW STRONGLY in the "
+                      "opposite sense (it favours smaller molecules); watch the "
+                      "known-drug LE percentile and LE-top size for fragment bias.")
+            elif abs(lp) < raw_abs:
+                print(f"      -> good: size dependence shrank "
+                      f"({raw_abs:.2f} -> {abs(lp):.2f}).")
+            else:
+                print("      -> LE did NOT reduce the MW dependence.")
+        else:  # logP — LE corrects size directly, lipophilicity only partly.
+            if abs(lp) > CORR_MODERATE:
+                print(f"      -> RESIDUAL LIPOPHILICITY confound (|r| > "
+                      f"{CORR_MODERATE}): LE debiases size, not logP. Escalate to "
+                      "a lipophilicity-aware correction (LLE).")
+            else:
+                print(f"      -> logP confound now weak (|r| <= {CORR_MODERATE}).")
     return out, flagged
 
 
@@ -386,24 +433,33 @@ def _percentile_better_than(score, distribution):
 
 
 def report_known_actives(sample_df):
-    """Dock the KNOWN_ACTIVES against PfDHFR; report each one's library percentile.
+    """Dock the KNOWN_ACTIVES against PfDHFR; report library percentile RAW and LE.
 
-    Returns ``(active_rows, best_library_score)`` for the final summary.
+    Each drug's percentile is reported both under the RAW docking distribution
+    (does it out-dock the library?) and under the LIGAND EFFICIENCY distribution
+    (does it out-efficiency the library?). Real drugs that were mid-pack on raw
+    score should RISE under LE once size is corrected — unless LE over-corrects,
+    in which case they fall (library winners become tiny fragments).
+
+    Returns ``(active_rows, best_library_score)``; each row carries both
+    ``percentile`` (raw) and ``le_percentile``.
     """
     print("\n" + "=" * 78)
-    print("5. KNOWN CLINICAL ANTIFOLATES vs THE LIBRARY DOCKING DISTRIBUTION")
+    print("5. KNOWN CLINICAL ANTIFOLATES vs THE LIBRARY — RAW and LE percentiles")
     print("=" * 78)
 
     dist = sample_df["docking"].to_numpy()
+    dist_le = (sample_df["docking"] / sample_df["heavy_atoms"]).to_numpy()
     best_lib = float(np.min(dist)) if dist.size else float("nan")
     median_lib = float(np.median(dist)) if dist.size else float("nan")
-    print(f"  Library docking sample (n={dist.size}): "
-          f"best {best_lib:.2f}, median {median_lib:.2f} kcal/mol.")
-    print("  Percentile = % of the library this drug out-docks "
-          "(higher = stronger binder).\n")
+    best_le = float(np.min(dist_le)) if dist_le.size else float("nan")
+    print(f"  Library sample (n={dist.size}): raw docking best {best_lib:.2f}, "
+          f"median {median_lib:.2f} kcal/mol;  best LE {best_le:.3f}.")
+    print("  pRaw = % of library this drug OUT-DOCKS; pLE = % it OUT-EFFICIENCIES "
+          "(both higher = better).\n")
 
     header = (f"  {'compound':<15}{'PfDHFR':>9}{'MW':>8}{'logP':>7}"
-              f"{'heavy':>7}{'LE':>8}{'pctile':>9}")
+              f"{'heavy':>7}{'LE':>8}{'pRaw':>7}{'pLE':>7}")
     print(header)
     print("  " + "-" * (len(header) - 2))
 
@@ -416,27 +472,33 @@ def report_known_actives(sample_df):
             active_rows.append({"name": a["name"], "score": float("nan"),
                                 "MW": float("nan"), "logP": float("nan"),
                                 "heavy": float("nan"), "LE": float("nan"),
-                                "percentile": float("nan")})
+                                "percentile": float("nan"),
+                                "le_percentile": float("nan")})
             continue
         mw, logp, hac = desc
         le = score / hac
         pct = _percentile_better_than(score, dist)
+        pct_le = _percentile_better_than(le, dist_le)
         active_rows.append({"name": a["name"], "score": float(score), "MW": mw,
                             "logP": logp, "heavy": hac, "LE": le,
-                            "percentile": pct})
+                            "percentile": pct, "le_percentile": pct_le})
         print(f"  {a['name']:<15}{score:>9.2f}{mw:>8.1f}{logp:>7.2f}"
-              f"{hac:>7}{le:>8.3f}{pct:>8.0f}%")
+              f"{hac:>7}{le:>8.3f}{pct:>6.0f}%{pct_le:>6.0f}%")
 
     finite = [r for r in active_rows if np.isfinite(r["percentile"])]
     if finite:
         med_pct = float(np.median([r["percentile"] for r in finite]))
-        print(f"\n  Median known-active percentile: {med_pct:.0f}%.")
-        if np.isfinite(best_lib):
-            best_active = min(r["score"] for r in finite)
-            gap = best_active - best_lib   # positive => library out-docks best drug
-            print(f"  Best library score {best_lib:.2f} vs best known drug "
-                  f"{best_active:.2f}  (library is {gap:+.2f} kcal/mol "
-                  f"{'stronger' if gap < 0 else 'weaker'}).")
+        med_pct_le = float(np.median([r["le_percentile"] for r in finite]))
+        move = med_pct_le - med_pct
+        direction = ("ROSE" if move > 2 else "FELL" if move < -2 else "held")
+        print(f"\n  Median known-active percentile: raw {med_pct:.0f}% -> "
+              f"LE {med_pct_le:.0f}%  (drugs {direction} under LE).")
+        if move > 2:
+            print("  Real drugs climb once size is corrected -> the raw 'winners' "
+                  "were size-inflated, and LE ranks the drugs more fairly.")
+        elif move < -2:
+            print("  Real drugs FALL under LE -> LE is likely over-correcting "
+                  "(library 'winners' are tiny fragments, not the real drugs).")
     return active_rows, best_lib
 
 
@@ -444,39 +506,58 @@ def report_known_actives(sample_df):
 # Figure
 # ---------------------------------------------------------------------- #
 def save_figure(sample_df, active_rows, output_path):
-    """Save docking-vs-MW and docking-vs-logP scatter with known actives overlaid."""
+    """Save a 2x2 scatter grid: RAW docking (top) and LE (bottom) vs MW and logP.
+
+    Top row is the original raw-docking diagnostic; bottom row is the same
+    molecules under ligand efficiency, so the size/lipophilicity confound before
+    vs after the correction is visible in one figure. Known actives are overlaid
+    as labeled stars on every panel.
+    """
     import matplotlib
     matplotlib.use("Agg")            # headless: write a file, never open a window
     import matplotlib.pyplot as plt
 
-    fig, axes = plt.subplots(1, 2, figsize=(13, 5.5))
-    y = sample_df["docking"].to_numpy()
-
+    fig, axes = plt.subplots(2, 2, figsize=(13, 10.5))
+    sample_le = (sample_df["docking"] / sample_df["heavy_atoms"]).to_numpy()
     active_ok = [r for r in active_rows if np.isfinite(r["score"])]
 
-    for ax, col, xlabel in ((axes[0], "MW", "Molecular weight (Da)"),
-                            (axes[1], "logP", "Crippen logP")):
-        ax.scatter(sample_df[col], y, s=18, c="lightsteelblue",
+    # (axis, x-column, x-label, sample-y, active-y-key, y-label, title)
+    panels = [
+        (axes[0, 0], "MW", "Molecular weight (Da)",
+         sample_df["docking"].to_numpy(), "score",
+         "PfDHFR docking (kcal/mol)  ↓ stronger", "RAW docking vs MW"),
+        (axes[0, 1], "logP", "Crippen logP",
+         sample_df["docking"].to_numpy(), "score",
+         "PfDHFR docking (kcal/mol)  ↓ stronger", "RAW docking vs logP"),
+        (axes[1, 0], "MW", "Molecular weight (Da)",
+         sample_le, "LE",
+         "Ligand efficiency (kcal/mol/atom)  ↓ better", "LE vs MW"),
+        (axes[1, 1], "logP", "Crippen logP",
+         sample_le, "LE",
+         "Ligand efficiency (kcal/mol/atom)  ↓ better", "LE vs logP"),
+    ]
+
+    for ax, col, xlabel, ysample, akey, ylabel, title in panels:
+        ax.scatter(sample_df[col], ysample, s=18, c="lightsteelblue",
                    edgecolors="none", alpha=0.7, label="Library sample")
-        # Known actives overlaid as distinct labeled markers.
         for r in active_ok:
-            ax.scatter(r[col], r["score"], marker="*", s=260, c="crimson",
+            ax.scatter(r[col], r[akey], marker="*", s=260, c="crimson",
                        edgecolors="black", linewidths=0.6, zorder=5)
-            ax.annotate(r["name"], (r[col], r["score"]),
+            ax.annotate(r["name"], (r[col], r[akey]),
                         textcoords="offset points", xytext=(6, 4), fontsize=8)
         if active_ok:
-            # A single proxy legend entry for the star markers.
             ax.scatter([], [], marker="*", s=160, c="crimson",
                        edgecolors="black", label="Known actives")
         ax.set_xlabel(xlabel)
-        ax.set_ylabel("PfDHFR docking (kcal/mol)  ↓ = stronger binding")
-        ax.invert_yaxis()            # stronger (more negative) binders at the top
+        ax.set_ylabel(ylabel)
+        ax.set_title(title, fontsize=10)
+        ax.invert_yaxis()            # stronger / more efficient at the top
         ax.grid(True, alpha=0.3)
         ax.legend(loc="best", fontsize=8)
 
-    fig.suptitle("Is the PfDHFR docking objective tracking binding, or size/lipophilicity?",
-                 fontsize=12)
-    fig.tight_layout(rect=(0, 0, 1, 0.96))
+    fig.suptitle("PfDHFR objective: RAW docking (top) vs LIGAND EFFICIENCY (bottom) "
+                 "— does LE remove the size/lipophilicity confound?", fontsize=12)
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
     print(f"\nSaved scatter figure to {output_path}")
@@ -538,34 +619,95 @@ def main():
     # --- Figure ---
     save_figure(sample_df, active_rows, args.output)
 
-    # --- 30-second verdict ---
+    # --- 30-second verdict: RAW -> LE for every diagnostic ---
     print("\n" + "=" * 78)
-    print("SUMMARY VERDICT (read this first)")
+    print("SUMMARY VERDICT (read this first):  RAW docking  ->  LIGAND EFFICIENCY")
     print("=" * 78)
-    if corrs:
-        mw_r = corrs["MW"][0]
-        logp_r = corrs["logP"][0]
-        print(f"  - docking vs MW:   Pearson {mw_r:+.2f} ({_strength_word(mw_r)})")
-        print(f"  - docking vs logP: Pearson {logp_r:+.2f} ({_strength_word(logp_r)})")
-    print(f"  - LE re-ranking:   top-{args.top_k} overlap "
-          f"{overlap_frac * 100:.0f}% (low overlap => raw score was size-driven)")
-    finite_pct = [r["percentile"] for r in active_rows if np.isfinite(r["percentile"])]
-    if finite_pct:
-        print(f"  - known drugs:     median percentile {np.median(finite_pct):.0f}% "
-              "of the library (low => library 'winners' out-dock real drugs)")
 
-    trustworthy = (not flagged) and overlap_frac >= 0.5
-    if flagged:
-        print("\n  VERDICT: CAUTION — docking correlates strongly with size/lipophilicity.")
-        print("  Treat raw PfDHFR docking as partly an artifact; use ligand")
-        print("  efficiency (or a MW/logP penalty) before trusting a 'better' score.")
-    elif not trustworthy:
-        print("\n  VERDICT: MIXED — no single strong correlation, but LE re-ranks the")
-        print("  leaders, so the top raw-score molecules are somewhat size-inflated.")
+    mw_raw = mw_le = logp_raw = logp_le = float("nan")
+    if corrs:
+        mw_raw, mw_le = corrs["MW"]["raw"][0], corrs["MW"]["le"][0]
+        logp_raw, logp_le = corrs["logP"]["raw"][0], corrs["logP"]["le"][0]
+        print(f"  - MW confound:    |r| {abs(mw_raw):.2f} ({_strength_word(mw_raw)})"
+              f"  ->  {abs(mw_le):.2f} ({_strength_word(mw_le)})")
+        print(f"  - logP confound:  |r| {abs(logp_raw):.2f} ({_strength_word(logp_raw)})"
+              f"  ->  {abs(logp_le):.2f} ({_strength_word(logp_le)})")
+    print(f"  - LE re-ranking:  top-{args.top_k} raw-vs-LE overlap "
+          f"{overlap_frac * 100:.0f}% (low => raw score was size-driven)")
+
+    raw_pcts = [r["percentile"] for r in active_rows if np.isfinite(r["percentile"])]
+    le_pcts = [r["le_percentile"] for r in active_rows
+               if np.isfinite(r["le_percentile"])]
+    med_raw = float(np.median(raw_pcts)) if raw_pcts else float("nan")
+    med_le = float(np.median(le_pcts)) if le_pcts else float("nan")
+    if raw_pcts:
+        print(f"  - known drugs:    median library percentile {med_raw:.0f}%  ->  "
+              f"{med_le:.0f}%  (should RISE if size was the confound)")
+
+    # Over-correction probe: are the LE leaders implausibly tiny fragments?
+    le_series = sample_df["docking"] / sample_df["heavy_atoms"]
+    k = min(args.top_k, len(sample_df))
+    le_top = sample_df.assign(_LE=le_series).sort_values("_LE").head(k)
+    le_top_heavy = float(le_top["heavy_atoms"].median()) if k else float("nan")
+    print(f"  - LE top-{k} size:  median {le_top_heavy:.0f} heavy atoms "
+          f"(< {FRAGMENT_HEAVY_ATOMS} => LE favouring fragments)")
+
+    # --- Decide the verdict, honestly ---
+    # Two distinct LE failure modes, in priority order:
+    #   (a) PATHOLOGICAL over-correction — LE-top are true fragments, or the known
+    #       drugs actually FALL under LE (the task's explicit "watch the known-drug
+    #       LE percentile" signal);
+    #   (b) SIZE OVER-SWING — LE did not merely remove the size trend, it inverted
+    #       it into a strong preference for smaller molecules (|LE-MW r| large).
+    #       Here the drugs may still benefit and LE-top may still be drug-sized, so
+    #       it is a caution (cap minimum size), not yet a failure.
+    #   plus the residual-lipophilicity case that needs LLE.
+    residual_logp = bool(corrs) and abs(logp_le) > CORR_MODERATE
+    drugs_fell = bool(raw_pcts and le_pcts) and (med_le + 2 < med_raw)
+    le_fragments = np.isfinite(le_top_heavy) and le_top_heavy < FRAGMENT_HEAVY_ATOMS
+    size_over_swing = bool(corrs) and abs(mw_le) > CORR_STRONG
+
+    if le_fragments or drugs_fell:
+        print("\n  VERDICT: OVER-CORRECTION — LE rewards implausibly small molecules")
+        print(f"  (LE-top median {le_top_heavy:.0f} heavy atoms; known drugs "
+              f"{med_raw:.0f}% -> {med_le:.0f}% under LE). LE divides by size, so it")
+        print("  has swung from a size confound to a fragment bias. Add a "
+              "minimum-size floor")
+        print("  (or use fit-quality / group efficiency) and re-check.")
+        if residual_logp:
+            print(f"  It ALSO leaves a lipophilicity confound (LE-logP |r|="
+                  f"{abs(logp_le):.2f} > {CORR_MODERATE}); pair the size floor with "
+                  "an LLE-style logP term.")
+    elif residual_logp:
+        print("\n  VERDICT: PARTIAL FIX — LE removed the SIZE confound "
+              f"(MW |r| {abs(mw_raw):.2f} -> {abs(mw_le):.2f}) but a LIPOPHILICITY")
+        print(f"  confound REMAINS (LE-logP |r|={abs(logp_le):.2f} > {CORR_MODERATE}). "
+              "LE corrects size directly and")
+        print("  logP only partly, so do NOT declare victory: escalate to a "
+              "lipophilicity-aware")
+        print("  correction (LLE = docking - c*logP, or LE with a logP penalty).")
+    elif size_over_swing:
+        print("\n  VERDICT: SIZE OVER-SWING — LE did NOT just remove the size trend, "
+              "it INVERTED it")
+        print(f"  (MW |r| {abs(mw_raw):.2f} -> {abs(mw_le):.2f}, now favouring "
+              "smaller molecules). Here it HELPS:")
+        print(f"  the known drugs rise {med_raw:.0f}% -> {med_le:.0f}% and the logP "
+              f"confound is gone ({abs(logp_raw):.2f} -> {abs(logp_le):.2f}), and "
+              f"LE-top are still")
+        print(f"  drug-sized (median {le_top_heavy:.0f} heavy atoms). But LE is now a "
+              "size-ANTIcorrelated objective:")
+        print("  floor the minimum size and monitor LE-top so optimization does not "
+              "drift into fragments.")
     else:
-        print("\n  VERDICT: OK — docking is not dominated by size/lipophilicity here;")
-        print("  the objective appears to track binding rather than an artifact.")
-    print("  (Corroborate with the known-active percentiles above and the figure.)")
+        print("\n  VERDICT: FIX VALIDATED — no residual size/lipophilicity confound "
+              "strong enough to worry about")
+        print(f"  (MW |r| {abs(mw_raw):.2f} -> {abs(mw_le):.2f}, logP |r| "
+              f"{abs(logp_raw):.2f} -> {abs(logp_le):.2f}); known drugs "
+              f"{med_raw:.0f}% -> {med_le:.0f}% and")
+        print(f"  LE leaders are drug-sized (median {le_top_heavy:.0f} heavy atoms). "
+              "Optimizing LE is sound.")
+    print("\n  (Corroborate with the RAW-vs-LE panels in the figure and the "
+          "percentiles above.)")
 
 
 if __name__ == "__main__":
