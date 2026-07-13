@@ -1,57 +1,57 @@
-"""Multi-Output Gaussian Process for molecular property prediction.
+"""Multi-output Gaussian Process over a CONTINUOUS latent molecular space.
 
-This module builds a batch-independent multi-output GP on top of the project's
-existing pieces:
+This module was rebuilt for the De-Novo / Latent-Space Bayesian Optimization
+(LSBO) migration. It no longer models fingerprints with a Tanimoto kernel; it
+models the VAE **latent vectors** (``vae_bridge.LatentSpaceBridge``) with a
+smooth stationary kernel, which is what a gradient-based acquisition optimizer
+(``botorch.optim.optimize_acqf``) needs to differentiate through.
 
-  * Morgan fingerprints (``utils/featurize.py``) as the molecular representation.
-  * A Tanimoto similarity kernel (``kernel.py``) as the GP covariance over those
-    fingerprints.
-  * The ADMET oracle (``admet_oracle.ADMETOracle``) that supplies the
-    regression/classification targets to learn.
+Two architectural shifts from the old grey-box design:
 
-The MOGP is a GREY-BOX model: it places one independent scaled-Tanimoto GP on
-each **docking** objective (``DOCKING_TASK_INDICES``) and packs them into a
-single ``MultitaskMultivariateNormal`` so predictions (mean and per-task
-uncertainty) come out together. The three ADMET objectives are **known exactly**
-for every candidate (precomputed in ``data.py``), so they are deliberately NOT
-modelled here — the acquisition folds their exact values in via a composite
-objective. Predictions are still returned in the fixed ``TASK_NAMES`` order
+  * **All 5 objectives are modelled.** The old code modelled only the 2 docking
+    objectives and folded in known-exact ADMET at acquisition time. In the
+    generative setting molecules are invented, so their ADMET is *not* known in
+    advance — every objective (2 docking + 3 ADMET) is now predicted by the GP.
+  * **Native BoTorch model.** The model is a ``ModelListGP`` of 5 independent
+    ``SingleTaskGP``s, each with a ``ScaleKernel(MaternKernel(nu=2.5,
+    ard_num_dims=latent_dim))`` and a per-output ``Standardize(1)`` outcome
+    transform, fit with ``fit_gpytorch_mll``. Because it is a first-class BoTorch
+    model, its posterior is differentiable w.r.t. the latent input, so
+    ``optimize_acqf`` can push gradients from the acquisition all the way back to
+    the latent vector ``z``.
+
+Predictions are returned in the fixed ``TASK_NAMES`` order
 ``[PfDHFR_Docking, hDHFR_Docking, hERG_Toxicity_Prob, Caco2_logPapp,
-Half_Life_hours]``, with the un-modelled ADMET columns returned as NaN.
+Half_Life_hours]`` — now ALL five columns carry real predictions.
 
-Run ``python mogp.py`` for a self-contained demo on a handful of known drugs.
+Run ``python mogp.py`` for a self-contained demo on random latent data.
 """
 
-import gpytorch
 import numpy as np
 import torch
 
-from admet_oracle import ADMETOracle
-from utils.featurize import smiles_to_morgan, batch_smiles_to_morgan
-from kernel import TanimotoKernel
+from botorch.models import SingleTaskGP, ModelListGP
+from botorch.models.transforms.outcome import Standardize
+from botorch.fit import fit_gpytorch_mll
+from gpytorch.mlls import SumMarginalLogLikelihood
+from gpytorch.kernels import ScaleKernel, MaternKernel
 
 
 # The fixed column order every Y matrix / prediction in this module adheres to.
 # This is the SINGLE SOURCE OF TRUTH for objective order everywhere in the
-# project (train_mogp, predict, acquisition, loop, baselines, evaluation,
-# dashboard). Import TASK_NAMES rather than hard-coding column strings.
+# project (train_mogp, predict, acquisition, loop, evaluation, dashboard).
+# Import TASK_NAMES rather than hard-coding column strings.
 #
-# Current objective set: a 5-objective POTENCY / SELECTIVITY / SAFETY / ADMET
-# problem.
+# 5-objective POTENCY / SELECTIVITY / SAFETY / ADMET problem:
 #   PfDHFR_Docking      minimize (strong parasite binding)
 #   hDHFR_Docking       MAXIMIZE (weak *human* binding -> selectivity)
 #   hERG_Toxicity_Prob  minimize (cardiac safety)
 #   Caco2_logPapp       MAXIMIZE (intestinal permeability / absorption)
 #   Half_Life_hours     MAXIMIZE (metabolic stability)
 #
-# The two docking objectives (PfDHFR/hDHFR) are the expensive scores evaluated
-# on the fly, whose cross-task correlation the coregionalized GP can exploit; the
-# three ADMET objectives (hERG, Caco2, Half_Life) are cheap and precomputed for
-# the whole library (data.py). Each name maps to its evaluation-time source in
-# OBJECTIVE_SOURCES below, and to its optimization direction in
-# acquisition.DEFAULT_OBJECTIVE_SIGNS (order-aligned with this list). Objectives
-# whose ADMET scores are out of domain arrive as NaN and are simply not observed
-# yet — the GP/acquisition/Pareto path handles a dynamic objective count.
+# Each name maps to its evaluation-time source in OBJECTIVE_SOURCES below, and to
+# its optimization direction in acquisition.DEFAULT_OBJECTIVE_SIGNS (order-aligned
+# with this list). In the LSBO setting all five are GP-modelled.
 TASK_NAMES = [
     "PfDHFR_Docking",
     "hDHFR_Docking",
@@ -60,70 +60,60 @@ TASK_NAMES = [
     "Half_Life_hours",
 ]
 
+N_TASKS = len(TASK_NAMES)
 
-# How each objective is PRODUCED at evaluation time. Two kinds:
-#   ("dock", "<TargetName>")    -> expensive: docking.batch_dock_target against
-#                                  that named receptor (see docking.TARGETS).
-#   ("library", "<admet_col>")  -> cheap: a precomputed column from the cached
-#                                  library (data.load_library / data.ADMET_COLUMNS).
-# This lets loop.py, the baselines and evaluation.py handle a mix of docking and
-# library objectives WITHOUT hard-coding column positions (the objectives are no
-# longer "ADMET first, one docking column last"): here two docking objectives
-# come first and three library objectives follow. The library refs must match
-# data.ADMET_COLUMNS names. Extra entries for objectives not in TASK_NAMES are
+
+# How each objective is PRODUCED at evaluation time, for a newly DECODED molecule:
+#   ("dock", "<TargetName>")    -> docking.batch_dock_targets against that named
+#                                  receptor (see docking.TARGETS).
+#   ("admet", "<column>")       -> a column of admet_oracle.ADMETOracle.predict().
+# In the generative setting the ADMET values are NOT precomputed (the molecule did
+# not exist until it was decoded), so they are produced on demand from the oracle
+# exactly like the docking scores. loop.py uses this to assemble the 5-objective
+# row for each decoded SMILES. Extra entries for objectives not in TASK_NAMES are
 # harmless and support swapping the objective set later.
 OBJECTIVE_SOURCES = {
     "PfDHFR_Docking":     ("dock", "PfDHFR"),
     "hDHFR_Docking":      ("dock", "hDHFR"),
-    "hERG_Toxicity_Prob": ("library", "hERG_Toxicity_Prob"),
-    "Caco2_logPapp":      ("library", "Caco2_logPapp"),
-    "Half_Life_hours":    ("library", "Half_Life_hours"),
+    "hERG_Toxicity_Prob": ("admet", "hERG_Toxicity_Prob"),
+    "Caco2_logPapp":      ("admet", "Caco2_logPapp"),
+    "Half_Life_hours":    ("admet", "Half_Life_hours"),
 }
 
 
-# Task indices (into TASK_NAMES) the GP actually models: ONLY the expensive
-# docking objectives. This is a GREY-BOX / composite setup. The three ADMET
-# objectives are cheap and KNOWN EXACTLY for every candidate (precomputed for the
-# whole library in data.py), so modelling them with a GP would only inject
-# avoidable predictive uncertainty into the acquisition and let the loop chase
-# ADMET "improvements" that are really model error. They are therefore left out
-# of the GP entirely and folded back in — exactly — by the acquisition's
-# composite objective (see acquisition.select_batch). Derived from
-# OBJECTIVE_SOURCES so nothing keys off a hard-coded column position; for the
-# current TASK_NAMES this is ``[0, 1]`` (PfDHFR_Docking, hDHFR_Docking).
+# Task indices (into TASK_NAMES) produced by docking vs. the ADMET oracle.
+# Derived from OBJECTIVE_SOURCES so nothing keys off a hard-coded column position.
 DOCKING_TASK_INDICES = [
-    j for j, name in enumerate(TASK_NAMES)
-    if OBJECTIVE_SOURCES[name][0] == "dock"
+    j for j, name in enumerate(TASK_NAMES) if OBJECTIVE_SOURCES[name][0] == "dock"
+]
+ADMET_TASK_INDICES = [
+    j for j, name in enumerate(TASK_NAMES) if OBJECTIVE_SOURCES[name][0] == "admet"
 ]
 
+# BoTorch multi-objective math runs in double precision throughout.
+_DTYPE = torch.double
 
-def resolve_objective_layout(admet_columns):
-    """Map the current ``TASK_NAMES`` onto their evaluation-time data sources.
 
-    Given the cached library's ADMET column order (``data.ADMET_COLUMNS``), work
-    out — once — which objective columns come from the library and which are
-    docked, so callers never hard-code positions. Passing ``admet_columns`` in
-    (rather than importing ``data`` here) keeps this module free of a heavy
-    import cycle.
-
-    Args:
-        admet_columns: The library's ADMET column names in stored order (i.e.
-            ``data.ADMET_COLUMNS``), used to resolve a library objective's
-            column index into ``load_library()["admet_scores"]``.
+def resolve_objective_layout():
+    """Map ``TASK_NAMES`` onto their evaluation-time data sources.
 
     Returns:
-        A tuple ``(library_tasks, docking_tasks, docking_targets)`` where:
-          * ``library_tasks``   = list of ``(task_index, admet_col_index)``
+        A tuple ``(admet_tasks, docking_tasks, docking_targets)`` where:
+          * ``admet_tasks``     = list of ``(task_index, admet_column_name)``
           * ``docking_tasks``   = list of ``(task_index, target_name)``
           * ``docking_targets`` = ordered unique target names to dock.
+
+    Unlike the pre-LSBO version this takes no ``admet_columns`` argument: ADMET
+    objectives now name their oracle output column directly (the oracle returns
+    columns by the same ``TASK_NAMES`` strings), so there is no positional
+    ``admet_scores`` array to resolve against.
     """
-    admet_columns = list(admet_columns)
-    library_tasks = []
+    admet_tasks = []
     docking_tasks = []
     for j, name in enumerate(TASK_NAMES):
         kind, ref = OBJECTIVE_SOURCES[name]
-        if kind == "library":
-            library_tasks.append((j, admet_columns.index(ref)))
+        if kind == "admet":
+            admet_tasks.append((j, ref))
         elif kind == "dock":
             docking_tasks.append((j, ref))
         else:
@@ -132,288 +122,131 @@ def resolve_objective_layout(admet_columns):
     for _, target in docking_tasks:
         if target not in docking_targets:
             docking_targets.append(target)
-    return library_tasks, docking_tasks, docking_targets
+    return admet_tasks, docking_tasks, docking_targets
 
 
-class MOGPModel(gpytorch.models.ExactGP):
-    """Batch-independent multi-output exact GP with a Tanimoto kernel.
-
-    One scaled-Tanimoto GP is fitted per objective (via a batch dimension over
-    tasks). The per-task GPs are combined into a single
-    ``MultitaskMultivariateNormal`` so the model jointly predicts all objectives.
+def build_model(train_x, train_y):
+    """Construct (untrained) the ``ModelListGP`` over the latent space.
 
     Args:
-        train_x: Fingerprint tensor of shape ``(N, 2048)``, float32.
-        train_y: Target tensor of shape ``(N, num_tasks)``, float32. ``num_tasks``
-            is inferred from ``train_y.shape[1]``.
-        likelihood: A ``MultitaskGaussianLikelihood`` with matching ``num_tasks``.
-    """
-
-    def __init__(self, train_x, train_y, likelihood):
-        super().__init__(train_x, train_y, likelihood)
-        num_tasks = train_y.shape[1]
-
-        # One constant mean and one scaled Tanimoto kernel per task. The batch
-        # dimension over tasks gives each objective its own outputscale (and the
-        # likelihood gives each its own noise), i.e. independent GPs per output.
-        self.mean_module = gpytorch.means.ConstantMean(
-            batch_shape=torch.Size([num_tasks])
-        )
-        self.covar_module = gpytorch.kernels.ScaleKernel(
-            TanimotoKernel(),
-            batch_shape=torch.Size([num_tasks]),
-        )
-
-    def forward(self, x):
-        # mean_x: (num_tasks, N), covar_x: (num_tasks, N, N) -> a batch of MVNs,
-        # one per task, repacked into a single multitask distribution shaped
-        # (N, num_tasks).
-        mean_x = self.mean_module(x)
-        covar_x = self.covar_module(x)
-        return gpytorch.distributions.MultitaskMultivariateNormal.from_batch_mvn(
-            gpytorch.distributions.MultivariateNormal(mean_x, covar_x)
-        )
-
-
-def get_training_data(smiles_list):
-    """Build the MOGP target matrix for a list of SMILES via the ADMET oracle.
-
-    Runs ``ADMETOracle.predict`` and keeps only molecules that are in-domain and
-    have complete oracle predictions: rows the oracle flags out-of-domain (any
-    per-model ``*_OutOfDomain`` flag or ``Featurization_Failed``) or carrying any
-    NaN oracle prediction are dropped.
-
-    Args:
-        smiles_list: Iterable of SMILES strings.
+        train_x: Latent-vector tensor/array of shape ``(N, latent_dim)``.
+        train_y: Target tensor/array of shape ``(N, N_TASKS)``, columns in
+            ``TASK_NAMES`` order. Must be fully observed (no NaN); the loop
+            filters failed evaluations before calling.
 
     Returns:
-        A tuple ``(Y, valid_smiles)`` where ``Y`` is a numpy array of shape
-        ``(N_valid, len(TASK_NAMES))``, float32, with columns in ``TASK_NAMES``
-        order. Only objectives the ADMET oracle supplies (the ``"library"``
-        sources in ``OBJECTIVE_SOURCES``, e.g. ``hERG_Toxicity_Prob``) are
-        filled; the docking objectives (``PfDHFR_Docking``, ``hDHFR_Docking``)
-        stay NaN as placeholders until the docking oracle is run.
-        ``valid_smiles`` is the list of SMILES that passed the filter (in input
-        order).
+        A ``ModelListGP`` of ``N_TASKS`` ``SingleTaskGP``s, each with a
+        ``ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=latent_dim))`` covariance
+        and a ``Standardize(1)`` outcome transform. Not yet fitted.
     """
-    oracle = ADMETOracle()
-    df = oracle.predict(smiles_list)
-
-    n_total = len(df)
-    # The ADMET oracle supplies the library objectives (hERG_Toxicity_Prob,
-    # Caco2_logPapp, Half_Life_hours); the docking objectives (PfDHFR_Docking,
-    # hDHFR_Docking) are not predicted here and stay NaN by design, so they are
-    # excluded from the NaN-drop check. Match by name, not position.
-    oracle_columns = [c for c in TASK_NAMES if c in df.columns]
-
-    # A molecule is out-of-domain / unusable if the featurizer dropped it or any
-    # per-model applicability-domain flag fired. admet_oracle emits per-model OOD
-    # flags (``*_OutOfDomain``) plus ``Featurization_Failed`` rather than a single
-    # combined warning column, so OR them together here (as data.build_library does).
-    flag_columns = ["Featurization_Failed"] + [
-        c for c in df.columns if c.endswith("_OutOfDomain")
-    ]
-    out_of_domain = df[flag_columns].to_numpy(dtype=bool).any(axis=1)
-    has_nan_pred = df[oracle_columns].isna().any(axis=1).to_numpy()
-    drop_mask = out_of_domain | has_nan_pred
-    keep_mask = ~drop_mask
-
-    n_dropped = int(drop_mask.sum())
-    n_ood = int(out_of_domain.sum())
-    # NaN-prediction drops that were not already flagged out-of-domain.
-    n_nan_only = int((has_nan_pred & ~out_of_domain).sum())
-    print(
-        f"get_training_data: {n_total} molecules in, {int(keep_mask.sum())} kept, "
-        f"{n_dropped} dropped ({n_ood} out-of-domain, "
-        f"{n_nan_only} additional with NaN predictions)."
-    )
-
-    kept = df[keep_mask]
-    valid_smiles = kept["SMILES"].tolist()
-
-    # Assemble Y in TASK_NAMES order; any task the oracle does not provide (i.e.
-    # PfDHFR_Docking) stays NaN as a placeholder.
-    Y = np.full((len(valid_smiles), len(TASK_NAMES)), np.nan, dtype=np.float32)
-    for j, name in enumerate(TASK_NAMES):
-        if name in kept.columns:
-            Y[:, j] = kept[name].to_numpy(dtype=np.float32)
-    return Y, valid_smiles
-
-
-def train_mogp(train_x, train_y, n_iterations=200, lr=0.1):
-    """Train the MOGP on fingerprints and (per-column normalized) targets.
-
-    Args:
-        train_x: Fingerprint matrix of shape ``(N, 2048)``, int8.
-        train_y: Target matrix of shape ``(N, num_tasks)``, float32, columns in
-            ``TASK_NAMES`` order (``num_tasks == len(TASK_NAMES)``).
-        n_iterations: Number of Adam steps.
-        lr: Adam learning rate.
-
-    Returns:
-        A tuple ``(model, likelihood, y_mean, y_std)`` where ``y_mean`` and
-        ``y_std`` are numpy arrays of shape ``(num_tasks,)`` used to reverse the target
-        normalization at prediction time. Only the docking columns
-        (``DOCKING_TASK_INDICES``) are trained: the model is fitted on those
-        columns alone (so its trained-task count is ``len(DOCKING_TASK_INDICES)``,
-        i.e. 2 for the current objective set), and every other column's
-        ``y_mean``/``y_std`` entry is NaN to mark it "not modelled". A docking
-        column that is itself entirely unobserved (all NaN) is also skipped.
-    """
-    train_x_t = torch.from_numpy(np.asarray(train_x)).to(torch.float32)
-    train_y = np.asarray(train_y, dtype=np.float32)
-
-    # Per-column standardization stats over the full task set. Columns that are
-    # not yet observed (all NaN, e.g. the PfDHFR_Docking placeholder) produce NaN
-    # stats and are skipped below: a GP cannot be trained on an unobserved target.
-    y_mean = train_y.mean(axis=0)
-    y_std = train_y.std(axis=0)
-    # Guard zero-variance columns (constant -> normalizes to 0, reverses to its
-    # mean). NaN stats for unobserved columns are left NaN to flag "not trained".
-    y_std = np.where(y_std == 0.0, 1.0, y_std)
-
-    # Grey-box: the GP models ONLY the docking objectives. The three ADMET
-    # objectives are known exactly for every candidate and are handled in the
-    # acquisition's composite objective, so they are excluded from the GP here by
-    # masking every non-docking column's normalization stats to NaN. This makes
-    # predict() return NaN for those columns (its public contract) and fits the
-    # model on the docking columns alone. A docking column that is itself still
-    # unobserved (all-NaN, e.g. before any docking) also drops out via its NaN stats.
-    docking_mask = np.zeros(train_y.shape[1], dtype=bool)
-    docking_mask[[j for j in DOCKING_TASK_INDICES if j < train_y.shape[1]]] = True
-    y_mean = np.where(docking_mask, y_mean, np.nan)
-    y_std = np.where(docking_mask, y_std, np.nan)
-
-    observed = np.isfinite(y_mean) & np.isfinite(y_std)
-    if not observed.any():
+    X = torch.as_tensor(train_x, dtype=_DTYPE)
+    Y = torch.as_tensor(train_y, dtype=_DTYPE)
+    if X.ndim != 2:
+        raise ValueError(f"train_x must be 2-D (N, latent_dim); got {tuple(X.shape)}.")
+    if Y.ndim != 2 or Y.shape[1] != N_TASKS:
         raise ValueError(
-            "train_mogp: no observed docking target columns to train on "
-            "(the grey-box GP models only the docking objectives)."
+            f"train_y must be (N, {N_TASKS}) in TASK_NAMES order; got {tuple(Y.shape)}."
+        )
+    if not torch.isfinite(Y).all():
+        raise ValueError(
+            "build_model: train_y contains non-finite values; filter failed "
+            "evaluations before fitting (each SingleTaskGP needs observed targets)."
         )
 
-    train_y_norm = (train_y[:, observed] - y_mean[observed]) / y_std[observed]
-    train_y_t = torch.from_numpy(train_y_norm).to(torch.float32)
-
-    num_tasks = int(observed.sum())
-    likelihood = gpytorch.likelihoods.MultitaskGaussianLikelihood(num_tasks=num_tasks)
-    model = MOGPModel(train_x_t, train_y_t, likelihood)
-
-    model.train()
-    likelihood.train()
-
-    # model.parameters() includes the likelihood's parameters because ExactGP
-    # registers the likelihood as a submodule.
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-    mll = gpytorch.mlls.ExactMarginalLogLikelihood(likelihood, model)
-
-    for i in range(n_iterations):
-        optimizer.zero_grad()
-        output = model(train_x_t)
-        loss = -mll(output, train_y_t)
-        loss.backward()
-        optimizer.step()
-        if (i + 1) % 20 == 0:
-            print(f"Iter {i + 1:>4}/{n_iterations} - loss: {loss.item():.4f}")
-
-    return model, likelihood, y_mean, y_std
+    latent_dim = X.shape[-1]
+    models = []
+    for i in range(N_TASKS):
+        yi = Y[:, i : i + 1]  # (N, 1): one SingleTaskGP per objective
+        gp = SingleTaskGP(
+            X,
+            yi,
+            covar_module=ScaleKernel(
+                MaternKernel(nu=2.5, ard_num_dims=latent_dim)
+            ),
+            outcome_transform=Standardize(m=1),
+        )
+        models.append(gp)
+    return ModelListGP(*models)
 
 
-def predict(model, likelihood, y_mean, y_std, X_new):
-    """Predict ADMET targets and uncertainty for new molecules.
+def train_mogp(train_x, train_y, n_iterations=None, lr=None):
+    """Fit the latent-space ``ModelListGP`` with ``fit_gpytorch_mll``.
 
     Args:
-        model: A trained ``MOGPModel``.
-        likelihood: The matching ``MultitaskGaussianLikelihood``.
-        y_mean: Normalization means, shape ``(num_tasks,)``.
-        y_std: Normalization stds, shape ``(num_tasks,)``.
-        X_new: Fingerprint matrix of shape ``(M, 2048)``, int8.
+        train_x: Latent vectors, shape ``(N, latent_dim)``.
+        train_y: Targets, shape ``(N, N_TASKS)`` in ``TASK_NAMES`` order,
+            fully observed.
+        n_iterations, lr: Accepted for signature compatibility with the old
+            Adam-based trainer and IGNORED — ``fit_gpytorch_mll`` uses BoTorch's
+            default (scipy L-BFGS-B) fit, which needs neither.
 
     Returns:
-        A tuple ``(mean, variance)`` of numpy arrays, each shape ``(M, num_tasks)``, with
-        columns in ``TASK_NAMES`` order on the original (de-normalized) scale.
-        ``variance`` is the per-objective predictive variance. Tasks the grey-box
-        GP does not model — the three ADMET objectives, which have NaN
-        normalization stats — are returned as NaN columns; only the docking
-        columns carry real predictions.
+        The fitted ``ModelListGP``. (The old ``(model, likelihood, y_mean, y_std)``
+        4-tuple is gone: the likelihood lives inside the model and normalization is
+        handled by each model's ``Standardize`` transform.)
     """
-    X_new_t = torch.from_numpy(np.asarray(X_new)).to(torch.float32)
+    model = build_model(train_x, train_y)
+    mll = SumMarginalLogLikelihood(model.likelihood, model)
+    fit_gpytorch_mll(mll)
+    return model
 
+
+def predict(model, X_new):
+    """Predict all 5 objectives (original units) for new latent vectors.
+
+    Args:
+        model: A fitted ``ModelListGP`` from ``train_mogp``.
+        X_new: Latent vectors of shape ``(M, latent_dim)``.
+
+    Returns:
+        A tuple ``(mean, variance)`` of numpy arrays, each shape ``(M, N_TASKS)``,
+        columns in ``TASK_NAMES`` order on the original (de-standardized) scale.
+        The ``Standardize`` outcome transforms are inverted by the posterior, so
+        these are already in real units.
+    """
+    X = torch.as_tensor(X_new, dtype=_DTYPE)
     model.eval()
-    likelihood.eval()
-
-    with torch.no_grad(), gpytorch.settings.fast_pred_var():
-        posterior = likelihood(model(X_new_t))
-        mean_obs = posterior.mean.cpu().numpy()
-        variance_obs = posterior.variance.cpu().numpy()
-
-    # Scatter the trained-task predictions back into the full TASK_NAMES layout,
-    # reversing the per-column standardization. Columns that were not trained
-    # (NaN normalization stats) stay NaN.
-    observed = np.isfinite(y_mean) & np.isfinite(y_std)
-    n_rows = mean_obs.shape[0]
-    n_tasks = y_mean.shape[0]
-    mean = np.full((n_rows, n_tasks), np.nan, dtype=float)
-    variance = np.full((n_rows, n_tasks), np.nan, dtype=float)
-    mean[:, observed] = mean_obs * y_std[observed] + y_mean[observed]
-    variance[:, observed] = variance_obs * (y_std[observed] ** 2)
+    with torch.no_grad():
+        posterior = model.posterior(X)
+        mean = posterior.mean.cpu().numpy()
+        variance = posterior.variance.cpu().numpy()
     return mean, variance
 
 
 if __name__ == "__main__":
-    train_smiles = {
-        "Aspirin": "CC(=O)Oc1ccccc1C(=O)O",
-        "Ibuprofen": "CC(C)Cc1ccc(cc1)C(C)C(=O)O",
-        "Paracetamol": "CC(=O)Nc1ccc(O)cc1",
-        "Chloroquine": "CCN(CC)CCCC(C)NC1=C2C=CC(=CC2=NC=C1)Cl",
-        "Pyrimethamine": "C1=CC(=NC(=N1)N)CC2=CC=C(C=C2)Cl",
-    }
+    torch.manual_seed(0)
+    np.random.seed(0)
 
-    valid_smiles = list(train_smiles.values())
+    latent_dim = 50
+    n_train = 16
 
-    # Self-contained demo: build a synthetic 5-objective target matrix (no live
-    # ADMET oracle needed; use get_training_data for oracle-backed ADMET). The
-    # grey-box GP models ONLY the docking objectives, so only those two columns
-    # need real training signal here; the three ADMET columns are "known" values
-    # the GP deliberately does NOT model (they are folded in exactly by the
-    # acquisition's composite objective at selection time).
-    rng = np.random.default_rng(0)
-    Y = np.zeros((len(valid_smiles), len(TASK_NAMES)), dtype=np.float32)
-    for j, name in enumerate(TASK_NAMES):
-        if OBJECTIVE_SOURCES[name][0] == "dock":
-            Y[:, j] = rng.uniform(-11.0, -5.0, size=len(valid_smiles))   # docking (kcal/mol)
-        else:
-            Y[:, j] = rng.uniform(0.0, 1.0, size=len(valid_smiles))      # known ADMET (stand-in)
+    # Random latent training set in the [-1, 1] box, with synthetic but smoothly
+    # varying targets so each per-objective GP has real signal to fit.
+    Z = np.random.uniform(-1.0, 1.0, size=(n_train, latent_dim))
+    Y = np.zeros((n_train, N_TASKS), dtype=float)
+    for j in range(N_TASKS):
+        w = np.random.uniform(-1.0, 1.0, size=latent_dim)
+        Y[:, j] = Z @ w + 0.05 * np.random.randn(n_train)
 
-    print("Synthetic target matrix Y (columns in TASK_NAMES order):")
-    print(f"{'molecule':>14}" + "".join(f"{h:>22}" for h in TASK_NAMES))
-    name_by_smiles = {s: n for n, s in train_smiles.items()}
-    for name, row in zip((name_by_smiles[s] for s in valid_smiles), Y):
-        print(f"{name:>14}" + "".join(f"{v:22.4f}" for v in row))
-    print("Note: the GP trains on the docking objectives only (here synthetic "
-          "stand-ins); the ADMET objectives are known exactly and left out of the GP.")
+    print(f"Fitting ModelListGP: {n_train} latent points, dim={latent_dim}, "
+          f"{N_TASKS} objectives ({len(DOCKING_TASK_INDICES)} docking, "
+          f"{len(ADMET_TASK_INDICES)} ADMET)...")
+    model = train_mogp(Z, Y)
+    print("Fit complete.")
 
-    # Fingerprints for the valid training molecules.
-    train_x = np.vstack([smiles_to_morgan(s) for s in valid_smiles])
-
-    print(f"\nTraining grey-box MOGP for 100 iterations "
-          f"({len(DOCKING_TASK_INDICES)} docking tasks)...")
-    model, likelihood, y_mean, y_std = train_mogp(train_x, Y, n_iterations=100)
-
-    new_smiles = {
-        "Artemisinin": "C1CC2CC(=O)OC3OC4(C)CCC1C(C)(C2)C34",
-        "Quinine": "COC1=CC2=C(C=CN=C2C=C1)C(O)C3CC4=CC=NC5=CC=C(C=C45)C3",
-    }
-    X_new, new_valid = batch_smiles_to_morgan(list(new_smiles.values()))
-    new_name_by_smiles = {s: n for n, s in new_smiles.items()}
-
-    mean, variance = predict(model, likelihood, y_mean, y_std, X_new)
+    # Predict on fresh latent points.
+    Z_new = np.random.uniform(-1.0, 1.0, size=(3, latent_dim))
+    mean, variance = predict(model, Z_new)
     std = np.sqrt(variance)
 
-    print(f"\nPredictions for new molecules (GP models docking only; ADMET NaN):")
-    for i, smiles in enumerate(new_valid):
-        name = new_name_by_smiles[smiles]
-        print(f"\n{name}:")
-        for j, task in enumerate(TASK_NAMES):
-            note = ("  <- not modelled by the GP (known exactly; NaN here)"
-                    if OBJECTIVE_SOURCES[task][0] != "dock" else "")
-            print(f"  {task:<20} = {mean[i, j]:.4f}  (std {std[i, j]:.4f}){note}")
+    assert mean.shape == (3, N_TASKS), mean.shape
+    assert np.isfinite(mean).all(), "predictions must be finite for all 5 objectives"
+
+    print(f"\nPredictions (shape {mean.shape}, all 5 objectives modelled):")
+    print(f"{'point':>6}" + "".join(f"{h:>22}" for h in TASK_NAMES))
+    for i in range(mean.shape[0]):
+        print(f"{i:>6}" + "".join(
+            f"{mean[i, j]:>12.3f}±{std[i, j]:<9.3f}" for j in range(N_TASKS)
+        ))
+
+    print("\nMOGP (ModelListGP over latent space) OK")

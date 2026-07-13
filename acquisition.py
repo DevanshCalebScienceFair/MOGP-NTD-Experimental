@@ -2,77 +2,54 @@
 acquisition.py
 ==============
 
-Grey-box qNEHVI acquisition for multi-objective molecular Bayesian optimization.
+qNEHVI acquisition for CONTINUOUS latent-space multi-objective Bayesian
+optimization (LSBO).
 
-The objective set (in ``TASK_NAMES`` order) mixes two EXPENSIVE, uncertain
-docking objectives with three CHEAP objectives that are KNOWN EXACTLY for every
-candidate:
+This module was rewritten for the De-Novo / Latent-Space migration. The old
+version ran a **discrete** candidate scan: it scored a fixed library of
+fingerprints in chunks and ranked them, using a grey-box composite objective that
+folded in known-exact ADMET values. That entire mechanism
+(``X_candidates`` chunking, ``DockingPosteriorModel``,
+``CompositeKnownADMETObjective``, ``_augment_with_admet``) is gone.
 
-    PfDHFR_Docking      -> LOWER  better  (docked on the fly; GP-modelled)
-    hDHFR_Docking       -> HIGHER better  (docked on the fly; GP-modelled)
-    hERG_Toxicity_Prob  -> LOWER  better  (precomputed ADMET; known exactly)
-    Caco2_logPapp       -> HIGHER better  (precomputed ADMET; known exactly)
-    Half_Life_hours     -> HIGHER better  (precomputed ADMET; known exactly)
+The loop now searches a bounded, continuous 50-D latent box. The GP
+(``mogp.ModelListGP``) models ALL five objectives directly, so acquisition is a
+clean, textbook multi-objective BoTorch setup:
 
-Because the three ADMET values are precomputed for the whole library
-(``data.py``), feeding them through a GP would only inject avoidable predictive
-uncertainty into the acquisition and let the loop chase ADMET "improvements" that
-are really model error. So this is a GREY-BOX / composite setup:
-
-  * The GP (``mogp.py``) models ONLY the two docking objectives
-    (``mogp.DOCKING_TASK_INDICES``); ``mogp.predict`` returns NaN for the ADMET
-    columns.
-  * Acquisition is BoTorch's noise-robust **qNEHVI**
-    (``qLogNoisyExpectedHypervolumeImprovement``) built on a 2-output docking
-    posterior, with a **composite objective**
-    (``CompositeKnownADMETObjective``) that, per candidate, concatenates that
-    candidate's EXACT known ADMET values onto the two sampled docking values to
-    form the full 5-D objective vector, then maps it into evaluation.py's shared
-    normalized [0, 1] maximization frame. qNEHVI then measures each composite
-    point's hypervolume improvement over the current front against the SINGLE
-    fixed reference point ``evaluation.FIXED_REFERENCE_POINT`` (all zeros).
-
-Scoring in that shared normalized frame is deliberate: the acquisition optimizes
-exactly the hypervolume ``evaluation.compute_hypervolume`` reports, so every
-objective — including hERG, whose tiny raw probability range would otherwise be
-dwarfed — carries its full weight in selection. qNEHVI (vs. plain EHVI) is
-noise-robust, which matches the noisy AutoDock Vina docking signal, AND, through
-the composite objective, uses the known ADMET exactly rather than a GP estimate.
+  * **qNEHVI** (``qLogNoisyExpectedHypervolumeImprovement``) over the 5-output
+    ``ModelListGP`` posterior.
+  * A ``WeightedMCMultiOutputObjective`` whose weights are the per-objective
+    signs (``DEFAULT_OBJECTIVE_SIGNS``), so the two "lower is better" objectives
+    are flipped and qNEHVI can treat everything as maximization.
+  * **``optimize_acqf``** does gradient-based (L-BFGS-B) optimization of the
+    acquisition directly over the latent ``bounds``, returning the winning latent
+    vector(s) ``z``. Because the ``ModelListGP`` posterior is differentiable
+    w.r.t. its input, gradients flow from the acquisition value all the way back
+    to ``z`` — the property the mock was built to verify.
 
 ``compute_pareto_front`` / ``get_reference_point`` (ORIGINAL units) and
 ``get_active_objectives`` are retained as shared helpers used across
-``evaluation.py``, ``loop.py`` and the baselines.
+``evaluation.py`` and ``loop.py``.
 """
-
-import warnings
 
 import numpy as np
 import torch
 
-from gpytorch.distributions import MultitaskMultivariateNormal
-from gpytorch.utils.warnings import GPInputWarning
-from botorch.models.model import Model
-from botorch.posteriors.gpytorch import GPyTorchPosterior
-from botorch.sampling.normal import SobolQMCNormalSampler
-from botorch.acquisition.multi_objective.objective import MCMultiOutputObjective
 from botorch.acquisition.multi_objective.logei import (
     qLogNoisyExpectedHypervolumeImprovement,
 )
-
-from mogp import (
-    train_mogp,
-    predict,
-    TASK_NAMES,
-    DOCKING_TASK_INDICES,
-    OBJECTIVE_SOURCES,
-    resolve_objective_layout,
+from botorch.acquisition.multi_objective.objective import (
+    WeightedMCMultiOutputObjective,
 )
-from kernel import TanimotoKernel
+from botorch.optim import optimize_acqf
+from botorch.sampling.normal import SobolQMCNormalSampler
+
+from mogp import TASK_NAMES, N_TASKS
 
 
 # Per-objective optimization direction in TASK_NAMES order: +1 = higher better,
-# -1 = lower better. This is the single source of truth for objective signs and
-# MUST stay aligned with mogp.TASK_NAMES (same length, same order).
+# -1 = lower better. Single source of truth for objective signs; MUST stay
+# aligned with mogp.TASK_NAMES (same length, same order).
 #   PfDHFR_Docking      -1  (minimize: strong parasite binding)
 #   hDHFR_Docking       +1  (maximize: weak human binding -> selectivity)
 #   hERG_Toxicity_Prob  -1  (minimize: cardiac safety)
@@ -80,17 +57,14 @@ from kernel import TanimotoKernel
 #   Half_Life_hours     +1  (maximize: metabolic stability)
 DEFAULT_OBJECTIVE_SIGNS = [-1, +1, -1, +1, +1]
 
-# Number of quasi-Monte-Carlo posterior samples qNEHVI draws for its estimate.
+# qNEHVI quasi-Monte-Carlo posterior sample count.
 N_MC_SAMPLES = 128
 
-# How many candidates to score per qNEHVI forward call. qNEHVI materializes a
-# (n_mc_samples, M, num_boxes, m) tensor, so scoring the whole un-evaluated
-# library (M in the thousands) at once blows past RAM within a few iterations —
-# num_boxes (the m-D box decomposition of the baseline front) also grows with the
-# evaluated set. Each candidate is an INDEPENDENT q=1 t-batch, so we score them in
-# fixed-size chunks and concatenate: identical per-candidate result, bounded peak
-# memory. Docking dominates wall-clock, so the extra Python-level calls are free.
-CANDIDATE_CHUNK = 128
+# optimize_acqf multi-start settings: number of L-BFGS-B restarts and the raw
+# random points used to seed them. Modest values keep the mock fast while still
+# exercising the real gradient-based optimizer.
+NUM_RESTARTS = 10
+RAW_SAMPLES = 256
 
 # BoTorch multi-objective utilities work in double precision.
 _DTYPE = torch.double
@@ -111,15 +85,13 @@ def compute_pareto_front(Y, signs=None):
 
     Args:
         Y: Objective matrix of shape ``(N, num_objectives)`` in ORIGINAL units.
-        signs: Optional list of +1/-1 per objective (higher/lower is better).
-            Defaults to ``DEFAULT_OBJECTIVE_SIGNS`` truncated to the number of
-            columns in ``Y``.
+        signs: Optional list of +1/-1 per objective. Defaults to
+            ``DEFAULT_OBJECTIVE_SIGNS`` truncated to the number of columns.
 
     Returns:
         A tuple ``(pareto_mask, pareto_Y)`` where ``pareto_mask`` is a boolean
         array of shape ``(N,)`` (True for Pareto-optimal rows) and ``pareto_Y``
-        is the array of Pareto-front rows in ORIGINAL units, shape
-        ``(P, num_objectives)``.
+        is the array of Pareto-front rows in ORIGINAL units.
     """
     Y = np.asarray(Y, dtype=float)
     n, m = Y.shape
@@ -134,15 +106,13 @@ def compute_pareto_front(Y, signs=None):
     for i in range(n):
         if not pareto_mask[i]:
             continue
-        # Does any point dominate row i? (>= on all objectives, > on at least one)
         ge_all = np.all(Y_max >= Y_max[i], axis=1)
         gt_any = np.any(Y_max > Y_max[i], axis=1)
         dominators = ge_all & gt_any
         if np.any(dominators):
             pareto_mask[i] = False
 
-    pareto_Y = Y[pareto_mask]
-    return pareto_mask, pareto_Y
+    return pareto_mask, Y[pareto_mask]
 
 
 def get_reference_point(Y, signs=None):
@@ -156,8 +126,7 @@ def get_reference_point(Y, signs=None):
 
     Args:
         Y: Objective matrix of shape ``(N, num_objectives)`` in ORIGINAL units.
-        signs: Optional list of +1/-1 per objective. Defaults to
-            ``DEFAULT_OBJECTIVE_SIGNS`` truncated to the number of columns.
+        signs: Optional list of +1/-1 per objective.
 
     Returns:
         Reference point array of shape ``(num_objectives,)`` in ORIGINAL units.
@@ -174,8 +143,8 @@ def get_reference_point(Y, signs=None):
 
     ref = np.where(
         signs > 0,
-        col_min - 0.1 * col_range,   # higher is better: worst is the minimum
-        col_max + 0.1 * col_range,   # lower is better: worst is the maximum
+        col_min - 0.1 * col_range,
+        col_max + 0.1 * col_range,
     )
     return ref.astype(float)
 
@@ -183,439 +152,165 @@ def get_reference_point(Y, signs=None):
 def get_active_objectives(Y_evaluated):
     """Return indices of objective columns that have real (non all-NaN) data.
 
-    Handles the dynamic objective count: a docking objective is all-NaN until the
-    docking module supplies it, so it is excluded until then.
-
     Args:
         Y_evaluated: Objective matrix of shape ``(N, num_objectives)``.
 
     Returns:
-        List of column indices (into the full objective layout) that contain
-        at least one finite value.
+        List of column indices that contain at least one finite value.
     """
     Y = np.asarray(Y_evaluated, dtype=float)
-    active = [j for j in range(Y.shape[1]) if np.isfinite(Y[:, j]).any()]
-    return active
+    return [j for j in range(Y.shape[1]) if np.isfinite(Y[:, j]).any()]
 
 
-# ---------------------------------------------------------------------- #
-# Grey-box composite pieces: a 2-output docking posterior + a composite
-# objective that folds in the KNOWN-EXACT ADMET values.
-# ---------------------------------------------------------------------- #
-def _resolve_admet_layout():
-    """Resolve how known ADMET columns map onto the objective layout.
+def _weighted_reference_point(Y, weights):
+    """A qNEHVI reference point in the WEIGHTED (all-maximization) frame.
 
-    Returns ``(dock_task_indices, lib_task_indices, lib_admet_cols)``:
-      * ``dock_task_indices``  = objective indices the GP models (docking).
-      * ``lib_task_indices``   = objective indices known exactly from the library.
-      * ``lib_admet_cols``     = for each library objective, WHICH column of the
-        ``admet_scores`` matrix (``data.ADMET_COLUMNS`` order) supplies it.
+    ``Y`` is in original units; ``weights`` are the per-objective signs. In the
+    weighted frame ``Y * weights`` every objective is "higher is better", so the
+    reference sits just below the worst weighted value on each objective:
+    ``min - (0.1 * range + eps)``. The small ``eps`` guarantees the reference is
+    strictly dominated even when an objective is (near-)constant — as it is in the
+    degenerate mock case where every decoded molecule scores identically.
 
-    Resolved from ``mogp.OBJECTIVE_SOURCES`` + ``data.ADMET_COLUMNS`` (imported
-    lazily so this module carries no heavy import), so nothing keys off a
-    hard-coded column position.
+    Returns a ``(num_objectives,)`` double tensor.
     """
-    from data import ADMET_COLUMNS
-
-    library_tasks, docking_tasks, _ = resolve_objective_layout(ADMET_COLUMNS)
-    dock_task_indices = [j for j, _ in docking_tasks]
-    lib_task_indices = [j for j, _ in library_tasks]
-    lib_admet_cols = [col for _, col in library_tasks]
-    return dock_task_indices, lib_task_indices, lib_admet_cols
+    Yw = np.asarray(Y, dtype=float) * np.asarray(weights, dtype=float)
+    col_min = Yw.min(axis=0)
+    col_range = Yw.max(axis=0) - col_min
+    ref = col_min - (0.1 * col_range + 1e-6)
+    return torch.as_tensor(ref, dtype=_DTYPE)
 
 
-def compose_objective_points(docking, admet_tail,
-                             dock_task_indices, lib_task_indices,
-                             num_objectives):
-    """Scatter sampled docking + KNOWN-EXACT ADMET into the full objective layout.
+def compute_qnehvi(model, train_x, train_y, bounds,
+                   batch_size=1, objective_signs=None,
+                   n_mc_samples=N_MC_SAMPLES,
+                   num_restarts=NUM_RESTARTS, raw_samples=RAW_SAMPLES,
+                   ref_point=None):
+    """Optimize qNEHVI over the continuous latent box; return winning vector(s) z.
 
-    Builds a ``(..., num_objectives)`` vector in ORIGINAL units whose docking
-    slots come from ``docking`` (the GP samples) and whose ADMET slots come
-    ONLY from ``admet_tail`` (the known values) — no ADMET value is ever read
-    from the GP posterior. Works for both torch tensors and numpy arrays.
+    Builds a noise-robust qNEHVI acquisition on the 5-output ``ModelListGP``
+    posterior, wraps the per-objective directions into a weighted (all-
+    maximization) objective, and runs ``optimize_acqf`` — gradient-based L-BFGS-B
+    with multi-start restarts — over ``bounds`` to find the latent vector(s) that
+    maximize expected hypervolume improvement over the current evaluated front.
 
     Args:
-        docking: ``(..., n_dock)`` docking values, columns ordered as
-            ``dock_task_indices``.
-        admet_tail: ``(..., n_admet)`` known ADMET values, columns ordered as
-            ``lib_task_indices``.
-        dock_task_indices: Objective indices the docking columns map to.
-        lib_task_indices: Objective indices the ADMET columns map to.
-        num_objectives: Total objective count (columns in the result).
-
-    Returns:
-        ``(..., num_objectives)`` array/tensor in ORIGINAL units.
-    """
-    dock_task_indices = list(dock_task_indices)
-    lib_task_indices = list(lib_task_indices)
-    columns = [None] * num_objectives
-    for k, j in enumerate(dock_task_indices):
-        columns[j] = docking[..., k]
-    for k, j in enumerate(lib_task_indices):
-        columns[j] = admet_tail[..., k]
-    if any(c is None for c in columns):
-        missing = [j for j, c in enumerate(columns) if c is None]
-        raise ValueError(
-            f"compose_objective_points: objective columns {missing} were not "
-            "supplied by either the docking or the library sources."
-        )
-    # Broadcast every column to a common shape before stacking: the docking
-    # samples carry qNEHVI's leading MC-sample dimension that the known ADMET
-    # tail (read straight from X) does not, so the ADMET columns broadcast across
-    # every posterior sample.
-    if torch.is_tensor(docking):
-        shape = torch.broadcast_shapes(*(c.shape for c in columns))
-        columns = [c.expand(shape) for c in columns]
-        return torch.stack(columns, dim=-1)
-    shape = np.broadcast_shapes(*(c.shape for c in columns))
-    columns = [np.broadcast_to(c, shape) for c in columns]
-    return np.stack(columns, axis=-1)
-
-
-class DockingPosteriorModel(Model):
-    """BoTorch wrapper exposing the grey-box GP as a docking-only posterior.
-
-    The acquisition input ``X`` is a fingerprint with the candidate's known
-    ADMET appended as a tail (see ``_augment_with_admet``); this model uses only
-    the leading ``n_fp`` fingerprint columns and returns a posterior over the
-    docking objectives (``num_outputs == len(dock_task_indices) == 2``). The
-    ADMET tail is ignored here — it is consumed exactly by the composite
-    objective, never predicted.
-
-    The posterior is assembled from ``mogp.predict``'s per-molecule marginal
-    mean/variance (original docking units) as an independent
-    ``MultitaskMultivariateNormal`` (diagonal covariance), which qNEHVI samples.
-    """
-
-    def __init__(self, model, likelihood, y_mean, y_std, n_fp, dock_task_indices):
-        super().__init__()
-        self._model = model
-        self._likelihood = likelihood
-        self._y_mean = y_mean
-        self._y_std = y_std
-        self._n_fp = int(n_fp)
-        self._dock = list(dock_task_indices)
-
-    @property
-    def num_outputs(self):
-        return len(self._dock)
-
-    def posterior(self, X, output_indices=None, observation_noise=False,
-                  posterior_transform=None):
-        *batch, q, _ = X.shape
-        k = len(self._dock)
-        fp = X[..., :self._n_fp].reshape(-1, self._n_fp).detach().cpu().numpy()
-        with warnings.catch_warnings():
-            # The evaluated baseline IS the GP's training set, so predicting on it
-            # trips GPyTorch's "input matches training data" notice every step.
-            # That is expected here (we want the posterior at those points).
-            warnings.simplefilter("ignore", GPInputWarning)
-            mean_np, var_np = predict(
-                self._model, self._likelihood, self._y_mean, self._y_std, fp
-            )
-        mean_d = torch.as_tensor(
-            mean_np[:, self._dock], dtype=_DTYPE
-        ).reshape(*batch, q, k)
-        var_d = torch.as_tensor(
-            np.clip(var_np[:, self._dock], 1e-9, None), dtype=_DTYPE
-        ).reshape(*batch, q, k)
-        # Independent (diagonal) joint posterior over the q x k docking outputs.
-        covar = torch.diag_embed(var_d.reshape(*batch, q * k))
-        mvn = MultitaskMultivariateNormal(mean_d, covar)
-        post = GPyTorchPosterior(mvn)
-        if posterior_transform is not None:
-            return posterior_transform(post)
-        return post
-
-
-class CompositeKnownADMETObjective(MCMultiOutputObjective):
-    r"""Composite objective: sampled docking + KNOWN-EXACT ADMET, normalized.
-
-    For each point, concatenates the GP-sampled DOCKING outputs with that point's
-    EXACT KNOWN ADMET values — read from the tail of the acquisition input ``X``,
-    NOT from the GP posterior — into the full objective vector, then maps it into
-    ``evaluation.py``'s shared [0, 1] maximization frame (so 1.0 = best on every
-    objective and the fixed all-zeros reference point applies). ADMET is therefore
-    used exactly; only the docking objectives carry model uncertainty.
-    """
-
-    def __init__(self, dock_task_indices, lib_task_indices, num_objectives,
-                 bounds, signs):
-        super().__init__()
-        self.dock_task_indices = list(dock_task_indices)
-        self.lib_task_indices = list(lib_task_indices)
-        self.num_objectives = int(num_objectives)
-        self.n_admet = len(self.lib_task_indices)
-
-        bounds = torch.as_tensor(bounds, dtype=_DTYPE)
-        lo = bounds[:, 0]
-        hi = bounds[:, 1]
-        span = hi - lo
-        # Guard zero-width objectives so normalization never divides by zero.
-        span = torch.where(span == 0, torch.ones_like(span), span)
-        self.register_buffer("_lo", lo)
-        self.register_buffer("_hi", hi)
-        self.register_buffer("_span", span)
-        self.register_buffer("_signs", torch.as_tensor(signs, dtype=_DTYPE))
-
-    def forward(self, samples, X=None):
-        if X is None:
-            raise RuntimeError(
-                "CompositeKnownADMETObjective requires X: the known ADMET values "
-                "are encoded in its tail."
-            )
-        admet_tail = X[..., -self.n_admet:].to(samples)
-        full = compose_objective_points(
-            samples, admet_tail,
-            self.dock_task_indices, self.lib_task_indices, self.num_objectives,
-        )
-        lo = self._lo.to(full)
-        hi = self._hi.to(full)
-        span = self._span.to(full)
-        s = self._signs.to(full)
-        # Higher-is-better: (y - lo)/span; lower-is-better: (hi - y)/span. Both
-        # put the best value at 1.0 and the worst at 0.0; clip so out-of-range
-        # values saturate into the cube rather than escaping it.
-        norm = torch.where(s > 0, (full - lo) / span, (hi - full) / span)
-        return norm.clamp(0.0, 1.0)
-
-
-def _augment_with_admet(X_fp, admet_rows, lib_admet_cols):
-    """Append each point's KNOWN ADMET (in library-task order) to its fingerprint.
-
-    ``admet_rows`` are raw ``admet_scores`` rows (``data.ADMET_COLUMNS`` order);
-    they are reordered by ``lib_admet_cols`` into library-task order so the tail
-    lines up with ``lib_task_indices`` when the composite objective reads it.
-    """
-    X_fp = np.asarray(X_fp, dtype=float)
-    admet_rows = np.asarray(admet_rows, dtype=float)
-    if admet_rows.ndim != 2 or admet_rows.shape[0] != X_fp.shape[0]:
-        raise ValueError(
-            "admet_rows must be a (N, n_admet) matrix aligned row-for-row with "
-            f"X_fp; got admet_rows {admet_rows.shape} vs X_fp {X_fp.shape}."
-        )
-    tail = admet_rows[:, list(lib_admet_cols)]
-    return np.concatenate([X_fp, tail], axis=1)
-
-
-def compute_qnehvi(model, likelihood, y_mean, y_std,
-                   X_candidates, candidate_admet,
-                   X_baseline, baseline_admet,
-                   objective_signs=None, bounds=None,
-                   ref_point=None, n_mc_samples=N_MC_SAMPLES, layout=None,
-                   candidate_chunk=CANDIDATE_CHUNK):
-    """Noisy Expected Hypervolume Improvement (qNEHVI) per candidate.
-
-    Builds a 2-output docking posterior and a composite objective that folds each
-    point's KNOWN-EXACT ADMET onto its sampled docking values, then scores every
-    candidate by its qNEHVI (log) hypervolume improvement over the current front
-    (defined by the GP posterior at the evaluated ``X_baseline`` points), in the
-    shared normalized frame of ``evaluation.py`` against its fixed reference.
-
-    Args:
-        model, likelihood, y_mean, y_std: Outputs of ``train_mogp`` (docking-only GP).
-        X_candidates: Candidate fingerprints, shape ``(M, n_fp)``.
-        candidate_admet: Candidates' KNOWN ADMET rows, shape ``(M, n_admet)``,
-            in ``data.ADMET_COLUMNS`` order (i.e. ``admet_scores`` rows).
-        X_baseline: Evaluated fingerprints, shape ``(B, n_fp)`` (the front).
-        baseline_admet: Evaluated points' KNOWN ADMET rows, shape ``(B, n_admet)``,
-            same column order as ``candidate_admet``.
+        model: A fitted ``mogp.ModelListGP`` (5 outputs, TASK_NAMES order).
+        train_x: Evaluated latent vectors, shape ``(B, latent_dim)`` — the qNEHVI
+            baseline (current front) ``X_baseline``.
+        train_y: Evaluated objectives, shape ``(B, N_TASKS)`` in ORIGINAL units,
+            used only to place the (weighted) reference point.
+        bounds: Latent search box as a ``(2, latent_dim)`` tensor (row 0 lower,
+            row 1 upper) — typically ``LatentSpaceBridge.bounds``.
+        batch_size: ``q`` for ``optimize_acqf``; number of latent vectors to
+            return jointly (they are naturally diverse — qNEHVI optimizes the
+            batch's *joint* hypervolume, so no separate diversity filter is needed).
         objective_signs: +1/-1 per objective; defaults to ``DEFAULT_OBJECTIVE_SIGNS``.
-        bounds: Optional ``(num_objectives, 2)`` normalization bounds; defaults to
-            ``evaluation.compute_objective_bounds()``.
-        ref_point: Optional normalized reference point; defaults to
-            ``evaluation.fixed_reference_point`` (all zeros).
         n_mc_samples: qNEHVI quasi-MC sample count.
-        layout: Optional ``(dock_task_indices, lib_task_indices, lib_admet_cols)``;
-            defaults to ``_resolve_admet_layout()``.
+        num_restarts, raw_samples: ``optimize_acqf`` multi-start settings.
+        ref_point: Optional explicit reference point (weighted frame); defaults to
+            ``_weighted_reference_point(train_y, signs)``.
 
     Returns:
-        Array of shape ``(M,)`` of qNEHVI scores; higher is more valuable to
-        evaluate next.
+        A tuple ``(candidates, acq_value)`` where ``candidates`` is a
+        ``(batch_size, latent_dim)`` double tensor of latent vectors within
+        ``bounds`` and ``acq_value`` is the scalar acquisition value achieved.
     """
-    # Imported here (not at module top) to avoid a circular import: evaluation
-    # imports this module for the Pareto/active-objective helpers.
-    from evaluation import compute_objective_bounds, fixed_reference_point
-
-    if layout is None:
-        layout = _resolve_admet_layout()
-    dock_task_indices, lib_task_indices, lib_admet_cols = layout
-
-    num_objectives = len(TASK_NAMES)
     if objective_signs is None:
-        objective_signs = _default_signs(num_objectives)
-    signs = np.asarray(objective_signs, dtype=float)
-    if bounds is None:
-        bounds = compute_objective_bounds()
-    bounds = np.asarray(bounds, dtype=float)
+        objective_signs = _default_signs(N_TASKS)
+    weights = torch.as_tensor(objective_signs, dtype=_DTYPE)
 
-    X_candidates = np.asarray(X_candidates)
-    X_baseline = np.asarray(X_baseline)
+    X_baseline = torch.as_tensor(train_x, dtype=_DTYPE)
+    Y = np.asarray(train_y, dtype=float)
     if X_baseline.shape[0] == 0:
         raise ValueError(
-            "compute_qnehvi: empty baseline; need at least one fully-evaluated "
+            "compute_qnehvi: empty baseline; need at least one evaluated "
             "molecule to define the current front."
         )
-    n_fp = X_candidates.shape[1]
+    bounds = torch.as_tensor(bounds, dtype=_DTYPE)
 
-    Xb_aug = torch.as_tensor(
-        _augment_with_admet(X_baseline, baseline_admet, lib_admet_cols),
-        dtype=_DTYPE,
-    )
-    Xc_aug = torch.as_tensor(
-        _augment_with_admet(X_candidates, candidate_admet, lib_admet_cols),
-        dtype=_DTYPE,
-    )
-
-    model_wrap = DockingPosteriorModel(
-        model, likelihood, y_mean, y_std, n_fp, dock_task_indices
-    )
-    objective = CompositeKnownADMETObjective(
-        dock_task_indices, lib_task_indices, num_objectives, bounds, signs
-    )
-    ref = (fixed_reference_point(num_objectives)
-           if ref_point is None else np.asarray(ref_point, dtype=float))
+    # Flip minimize->maximize so qNEHVI (a maximizer) optimizes every objective in
+    # the correct direction. The reference point lives in this same weighted frame.
+    objective = WeightedMCMultiOutputObjective(weights=weights)
+    ref = (_weighted_reference_point(Y, objective_signs)
+           if ref_point is None else torch.as_tensor(ref_point, dtype=_DTYPE))
 
     sampler = SobolQMCNormalSampler(sample_shape=torch.Size([int(n_mc_samples)]))
     acqf = qLogNoisyExpectedHypervolumeImprovement(
-        model=model_wrap,
-        ref_point=torch.as_tensor(ref, dtype=_DTYPE),
-        X_baseline=Xb_aug,
+        model=model,
+        ref_point=ref,
+        X_baseline=X_baseline,
         sampler=sampler,
         objective=objective,
-        # Our custom marginal posterior does not support the low-rank root cache,
-        # and pruning the baseline is unnecessary for a discrete candidate scan.
-        prune_baseline=False,
-        cache_root=False,
+        prune_baseline=True,
     )
 
-    # Score each candidate independently as its own q=1 t-batch -> shape (M,).
-    # Chunk the candidate (t-batch) dimension so qNEHVI's internal
-    # (n_mc_samples, M, num_boxes, m) tensor never materializes for the whole
-    # library at once (scoring the full pool OOM-kills the process within a few
-    # iterations). Each candidate is scored independently, so this is a valid
-    # per-candidate qNEHVI estimate with bounded peak memory; it is deterministic
-    # and reproducible for a fixed chunk size, though not bit-identical to a
-    # single-shot call, since the quasi-MC Sobol draws depend on t-batch size.
-    Xc_q = Xc_aug.unsqueeze(1)
-    chunk = max(1, int(candidate_chunk))
-    chunk_scores = []
-    with torch.no_grad():
-        for start in range(0, Xc_q.shape[0], chunk):
-            batch_scores = acqf(Xc_q[start:start + chunk])
-            chunk_scores.append(batch_scores.detach().cpu())
-    scores = torch.cat(chunk_scores, dim=0)
-    return np.asarray(scores.numpy(), dtype=float)
-
-
-def select_batch(model, likelihood, y_mean, y_std,
-                 X_candidates, candidate_admet,
-                 X_baseline, baseline_admet,
-                 batch_size=20, diversity_threshold=0.7,
-                 objective_signs=None, n_mc_samples=N_MC_SAMPLES, layout=None):
-    """Greedily select a diverse, high-qNEHVI batch of candidates.
-
-    Candidates are ranked by their qNEHVI score (``compute_qnehvi``), then walked
-    in descending order; a candidate is added only if its maximum Tanimoto
-    similarity to the already-selected molecules is below ``diversity_threshold``
-    (so the batch stays structurally diverse). Selection stops at ``batch_size``
-    or when candidates run out.
-
-    Args:
-        model, likelihood, y_mean, y_std: Outputs of ``train_mogp`` (docking-only GP).
-        X_candidates: Candidate fingerprints, shape ``(M, n_fp)``.
-        candidate_admet: Candidates' KNOWN ADMET rows, shape ``(M, n_admet)``,
-            in ``data.ADMET_COLUMNS`` order (``admet_scores`` rows). These exact
-            values — never a GP estimate — enter the composite objective.
-        X_baseline: Evaluated fingerprints, shape ``(B, n_fp)`` (defines the front).
-        baseline_admet: Evaluated points' KNOWN ADMET rows, shape ``(B, n_admet)``.
-        batch_size: Number of molecules to select.
-        diversity_threshold: Max allowed Tanimoto similarity to any already-
-            selected molecule.
-        objective_signs, n_mc_samples, layout: Passed through to ``compute_qnehvi``.
-
-    Returns:
-        A tuple ``(selected_indices, selected_scores)`` of int and float arrays
-        (indices into ``X_candidates`` and their qNEHVI scores). Length is
-        ``batch_size`` unless diversity exhausts the candidates first.
-    """
-    X_candidates = np.asarray(X_candidates)
-    scores = compute_qnehvi(
-        model, likelihood, y_mean, y_std,
-        X_candidates, candidate_admet, X_baseline, baseline_admet,
-        objective_signs=objective_signs, n_mc_samples=n_mc_samples, layout=layout,
+    candidates, acq_value = optimize_acqf(
+        acq_function=acqf,
+        bounds=bounds,
+        q=int(batch_size),
+        num_restarts=int(num_restarts),
+        raw_samples=int(raw_samples),
     )
-
-    # Rank candidates by qNEHVI score, highest first.
-    ranked = np.argsort(-scores)
-
-    kernel = TanimotoKernel()
-    X_t = torch.from_numpy(np.asarray(X_candidates)).to(torch.float32)
-
-    selected = []
-    for idx in ranked:
-        if len(selected) >= batch_size:
-            break
-        if not selected:
-            selected.append(int(idx))
-            continue
-        # Tanimoto similarity of this candidate to every selected molecule.
-        sims = kernel.forward(X_t[idx:idx + 1], X_t[selected]).squeeze(0)
-        if float(sims.max()) < diversity_threshold:
-            selected.append(int(idx))
-
-    selected_indices = np.asarray(selected, dtype=int)
-    selected_scores = scores[selected_indices]
-    return selected_indices, selected_scores
+    return candidates.detach(), acq_value.detach()
 
 
 if __name__ == "__main__":
-    np.random.seed(0)
+    # Self-contained smoke test of the continuous acquisition path: fit the latent
+    # GP on random data, then verify optimize_acqf returns in-bounds latent
+    # vectors AND that the acquisition is differentiable w.r.t. z (gradients flow).
+    from mogp import train_mogp
+    from vae_bridge import LatentSpaceBridge
+
     torch.manual_seed(0)
+    np.random.seed(0)
 
-    # Objective layout WITHOUT importing the (heavy) data module: docking indices
-    # from OBJECTIVE_SOURCES, and library ADMET passed already in library-task
-    # order (so lib_admet_cols is the identity).
-    dock_idx = list(DOCKING_TASK_INDICES)
-    lib_idx = [j for j, name in enumerate(TASK_NAMES)
-               if OBJECTIVE_SOURCES[name][0] != "dock"]
-    layout = (dock_idx, lib_idx, list(range(len(lib_idx))))
-    n_admet = len(lib_idx)
-    n_fp = 2048
+    bridge = LatentSpaceBridge(latent_dim=50)
+    latent_dim = bridge.latent_dim
+    n_train = 16
 
-    # Sparse random 2048-bit fingerprints (~5% on bits) for baseline + candidates.
-    n_baseline, n_cand = 12, 25
-    X_baseline = (np.random.rand(n_baseline, n_fp) < 0.05).astype(np.int8)
-    X_candidates = (np.random.rand(n_cand, n_fp) < 0.05).astype(np.int8)
+    Z = np.random.uniform(-1.0, 1.0, size=(n_train, latent_dim))
+    Y = np.zeros((n_train, N_TASKS), dtype=float)
+    for j in range(N_TASKS):
+        w = np.random.uniform(-1.0, 1.0, size=latent_dim)
+        Y[:, j] = Z @ w + 0.05 * np.random.randn(n_train)
 
-    # Known ADMET (library-task order) for baseline + candidates.
-    baseline_admet = np.random.uniform(0.0, 1.0, size=(n_baseline, n_admet)).astype(np.float32)
-    candidate_admet = np.random.uniform(0.0, 1.0, size=(n_cand, n_admet)).astype(np.float32)
+    print(f"Fitting latent GP on {n_train} points (dim={latent_dim})...")
+    model = train_mogp(Z, Y)
 
-    # Grey-box GP trains on the docking columns only; the ADMET columns of Y are
-    # present but ignored by the GP (train_mogp masks them out).
-    Y = np.zeros((n_baseline, len(TASK_NAMES)), dtype=np.float32)
-    for j in dock_idx:
-        Y[:, j] = np.random.uniform(-11.0, -5.0, size=n_baseline)
-    for k, j in enumerate(lib_idx):
-        Y[:, j] = baseline_admet[:, k]
+    q = 3
+    print(f"Optimizing qNEHVI with optimize_acqf (q={q})...")
+    candidates, acq_value = compute_qnehvi(model, Z, Y, bridge.bounds, batch_size=q)
 
-    print(f"Training grey-box MOGP on {n_baseline} fake molecules "
-          f"({len(dock_idx)} docking tasks)...")
-    model, likelihood, y_mean, y_std = train_mogp(X_baseline, Y, n_iterations=50)
+    print(f"candidates shape = {tuple(candidates.shape)} (expected ({q}, {latent_dim}))")
+    assert candidates.shape == (q, latent_dim)
+    lo, hi = bridge.bounds[0], bridge.bounds[1]
+    assert torch.all(candidates >= lo - 1e-6) and torch.all(candidates <= hi + 1e-6), \
+        "optimize_acqf returned an out-of-bounds latent vector"
+    print(f"acq_value = {float(acq_value):.6f}")
 
-    selected_indices, selected_scores = select_batch(
-        model, likelihood, y_mean, y_std,
-        X_candidates, candidate_admet, X_baseline, baseline_admet,
-        batch_size=5, layout=layout,
+    # --- Explicit gradient-flow check: rebuild the acqf and differentiate it
+    # w.r.t. a latent input, confirming the numpy bridge no longer severs autograd.
+    objective = WeightedMCMultiOutputObjective(
+        weights=torch.tensor(DEFAULT_OBJECTIVE_SIGNS, dtype=_DTYPE)
     )
+    sampler = SobolQMCNormalSampler(sample_shape=torch.Size([N_MC_SAMPLES]))
+    acqf = qLogNoisyExpectedHypervolumeImprovement(
+        model=model,
+        ref_point=_weighted_reference_point(Y, DEFAULT_OBJECTIVE_SIGNS),
+        X_baseline=torch.as_tensor(Z, dtype=_DTYPE),
+        sampler=sampler,
+        objective=objective,
+        prune_baseline=True,
+    )
+    z = torch.as_tensor(
+        np.random.uniform(-1.0, 1.0, size=(1, 1, latent_dim)), dtype=_DTYPE
+    ).requires_grad_(True)
+    val = acqf(z)
+    val.backward()
+    assert z.grad is not None and torch.isfinite(z.grad).all(), \
+        "gradient did not flow from qNEHVI back to the latent vector z"
+    grad_norm = float(z.grad.norm())
+    print(f"grad ||dAcq/dz|| = {grad_norm:.6e} (finite, non-None -> autograd intact)")
 
-    print("\nSelected molecules (candidate index -> qNEHVI score):")
-    for idx, score in zip(selected_indices, selected_scores):
-        print(f"  candidate {int(idx):>2}  qNEHVI = {float(score):.6f}")
-
-    if len(selected_indices) == 5:
-        print("\nACQUISITION TEST PASSED")
-    else:
-        print(f"\nACQUISITION TEST FAILED: selected {len(selected_indices)} "
-              "molecules (expected 5)")
+    print("\nCONTINUOUS ACQUISITION + GRADIENT-FLOW TEST PASSED")
