@@ -39,6 +39,7 @@ Run ``python loop.py --help`` for the command-line options.
 """
 
 import os
+import sys
 import time
 import argparse
 
@@ -47,7 +48,25 @@ import torch
 import pandas as pd
 
 from rdkit import Chem
-from rdkit.Chem import Descriptors, Crippen, Lipinski
+from rdkit.Chem import Descriptors, Crippen, Lipinski, QED
+
+# --- Synthesizability metric (contrib import, handled cleanly) --------------
+# Prefer Ertl's Synthetic Accessibility (SA) score (1 = easy .. 10 = hard),
+# the standard "can a chemist actually make this?" heuristic. It lives in
+# RDKit's *contrib* tree, so it needs an explicit sys.path hookup that can fail
+# on some installs; we guard the import and fall back to QED (RDKit core,
+# 0 = poor .. 1 = excellent drug-likeness) if SA is unavailable. Either way the
+# gate below is deliberately generous.
+try:
+    from rdkit.Chem import RDConfig
+    _sa_dir = os.path.join(RDConfig.RDContribDir, "SA_Score")
+    if _sa_dir not in sys.path:
+        sys.path.append(_sa_dir)
+    import sascorer  # noqa: E402  (RDKit contrib module, added to path above)
+    _SYNTH_METRIC = "SA"
+except Exception:
+    sascorer = None
+    _SYNTH_METRIC = "QED"
 
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 
@@ -82,6 +101,14 @@ LOGP_MAX = 5.0          # Lipinski cLogP
 HBD_MAX = 5             # Lipinski H-bond donors
 HBA_MAX = 10            # Lipinski H-bond acceptors
 
+# Synthesizability / drug-likeness gate — deliberately GENEROUS so we never throw
+# away a highly potent scaffold just because it is a bit awkward to synthesize.
+# Only one of these applies, depending on which metric imported above:
+#   SA score : reject if > SA_SCORE_MAX (typical marketed drugs sit ~2-5; 6 is lax)
+#   QED      : reject if < QED_MIN      (0.3 keeps all but clearly non-drug-like mols)
+SA_SCORE_MAX = 6.0
+QED_MIN = 0.3
+
 # Penalty objective row assigned to a REJECTED molecule (TASK_NAMES order). Each
 # value is directionally the WORST outcome for its objective given
 # DEFAULT_OBJECTIVE_SIGNS = [-1, +1, -1, +1, +1], so a rejected point is dominated
@@ -96,6 +123,14 @@ HBA_MAX = 10            # Lipinski H-bond acceptors
 #   Caco2_logPapp  (max)  -> -8.0    : very poor permeability
 #   Half_Life_hours(max)  ->  0.0    : ~zero half-life
 REJECTION_PENALTY = np.array([0.0, -14.0, 1.0, -8.0, 0.0], dtype=np.float64)
+
+# Mode-collapse guard, molecule level. The latent-distance guard in
+# acquisition.compute_qnehvi keeps proposed z's apart, but the VAE decoder is
+# MANY-TO-ONE: distinct z's can still decode to a molecule we already evaluated.
+# Each BO step therefore over-generates from qNEHVI and keeps only decodes that
+# are novel (vs. every prior molecule and vs. the batch so far), re-querying for
+# any shortfall up to this many rounds before proceeding with what it has.
+MAX_PROPOSAL_ROUNDS = 5
 
 
 class BOLoop:
@@ -154,8 +189,9 @@ class BOLoop:
     def _screen(smiles):
         """Cheap RDKit drug-likeness screen. Returns ``(passed, reason)``.
 
-        Rejects molecules that are unparseable, exceed ``MAX_HEAVY_ATOMS``, or
-        violate the Lipinski Rule-of-Five thresholds (MW, cLogP, HBD, HBA).
+        Rejects molecules that are unparseable, exceed ``MAX_HEAVY_ATOMS``,
+        violate the Lipinski Rule-of-Five thresholds (MW, cLogP, HBD, HBA), or
+        fail a generous synthesizability gate (SA score, or QED as a fallback).
         """
         mol = Chem.MolFromSmiles(smiles) if smiles else None
         if mol is None:
@@ -170,6 +206,13 @@ class BOLoop:
             return False, f"HBD>{HBD_MAX}"
         if Lipinski.NumHAcceptors(mol) > HBA_MAX:
             return False, f"HBA>{HBA_MAX}"
+        # Generous synthesizability / drug-likeness gate (SA preferred, QED fallback).
+        if sascorer is not None:
+            if sascorer.calculateScore(mol) > SA_SCORE_MAX:
+                return False, f"SA>{SA_SCORE_MAX:g}"
+        else:
+            if QED.qed(mol) < QED_MIN:
+                return False, f"QED<{QED_MIN:g}"
         return True, "ok"
 
     def _evaluate(self, smiles_list):
@@ -294,6 +337,59 @@ class BOLoop:
               f"{len(rejections)} rejected pre-dock, "
               f"docked {docked_summary(docking, self.n_init)}.")
 
+    def _propose_batch(self, model, Z_train, Y_train):
+        """Propose the next batch of (latent vector, decoded SMILES) pairs.
+
+        Diversity is enforced at TWO levels. ``compute_qnehvi`` enforces LATENT
+        distance (no two z's on the same coordinate); here we additionally enforce
+        MOLECULE novelty, because the many-to-one VAE decoder can map distinct z's
+        to a molecule already evaluated. We over-generate from qNEHVI and greedily
+        keep only novel decodes (vs. every prior molecule and vs. the batch so
+        far), re-querying for any shortfall up to ``MAX_PROPOSAL_ROUNDS`` rounds.
+
+        Returns ``(Z_new, smiles_new, acq_value)``. If the decoder is so collapsed
+        that no novel molecule can be found, the batch may be smaller than
+        ``batch_size`` (and, in the degenerate case, falls back to the raw qNEHVI
+        batch) so the campaign never stalls.
+        """
+        seen = set(self.smiles)
+        chosen_z, chosen_smiles = [], []
+        last_acq = 0.0
+        for _ in range(MAX_PROPOSAL_ROUNDS):
+            need = self.batch_size - len(chosen_z)
+            if need <= 0:
+                break
+            # Avoid every latent point spent so far AND the ones chosen this step.
+            avoid = self.Z_evaluated
+            if chosen_z:
+                avoid = np.vstack([avoid, np.asarray(chosen_z)])
+            candidates, acq_value = compute_qnehvi(
+                model, Z_train, Y_train, self.bounds, batch_size=need,
+                avoid_points=avoid,
+            )
+            last_acq = float(acq_value)
+            smi_batch = self.bridge.decode(candidates)
+            for z_i, smi_i in zip(candidates.cpu().numpy(), smi_batch):
+                if smi_i in seen:
+                    continue
+                chosen_z.append(z_i)
+                chosen_smiles.append(smi_i)
+                seen.add(smi_i)
+                if len(chosen_z) >= self.batch_size:
+                    break
+
+        if not chosen_z:
+            # Decoder fully collapsed onto known molecules; proceed with the raw
+            # qNEHVI batch rather than stalling (these will be re-evaluated).
+            candidates, acq_value = compute_qnehvi(
+                model, Z_train, Y_train, self.bounds, batch_size=self.batch_size,
+                avoid_points=self.Z_evaluated,
+            )
+            return (candidates.cpu().numpy(),
+                    list(self.bridge.decode(candidates)), float(acq_value))
+
+        return np.asarray(chosen_z), chosen_smiles, last_acq
+
     def step(self):
         """Run one BO iteration: train, optimize qNEHVI, decode, evaluate, record."""
         iteration = len(self.history) + 1
@@ -309,16 +405,8 @@ class BOLoop:
             n_iterations=self.mogp_train_iters, lr=self.mogp_lr,
         )
 
-        # --- Optimize qNEHVI over the continuous latent box ---
-        # optimize_acqf returns a (batch_size, latent_dim) tensor of latent
-        # vectors that jointly maximize expected hypervolume improvement.
-        candidates, acq_value = compute_qnehvi(
-            model, Z_train, Y_train, self.bounds, batch_size=self.batch_size,
-        )
-        Z_new = candidates.cpu().numpy()
-
-        # --- Decode the winning latent vectors into brand-new molecules ---
-        smiles_new = self.bridge.decode(candidates)
+        # --- Propose a diverse, novel batch (latent-distance + molecule novelty) ---
+        Z_new, smiles_new, acq_value = self._propose_batch(model, Z_train, Y_train)
 
         # --- Evaluate the decoded molecules on all 5 objectives (screen first) ---
         Y_new, docking_new, rejections = self._evaluate(smiles_new)

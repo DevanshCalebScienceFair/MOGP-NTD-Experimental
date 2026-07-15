@@ -66,6 +66,16 @@ N_MC_SAMPLES = 128
 NUM_RESTARTS = 10
 RAW_SAMPLES = 256
 
+# Mode-collapse guard. Minimum L2 distance a newly proposed latent vector must
+# keep from every already-evaluated point (and from the other members of its own
+# batch). Without this, qNEHVI can keep re-proposing essentially the SAME latent
+# coordinate it already exploited — the "duplicate molecules in one latent
+# valley" failure. The default is deliberately TINY relative to the 50-D [-1, 1]
+# box (a per-dimension gap of only ~0.014 summed in quadrature), so it rejects
+# near-exact repeats without discouraging genuinely new nearby chemistry. Set to
+# 0 to disable the guard entirely (restores the pure joint-qNEHVI behavior).
+DEFAULT_MIN_LATENT_DIST = 0.1
+
 # BoTorch multi-objective utilities work in double precision.
 _DTYPE = torch.double
 
@@ -181,11 +191,92 @@ def _weighted_reference_point(Y, weights):
     return torch.as_tensor(ref, dtype=_DTYPE)
 
 
+def _nearest_dist(z, ref):
+    """Smallest L2 distance from the single point ``z`` (1, d) to any row of
+    ``ref`` (M, d). Returns ``+inf`` when ``ref`` is empty (nothing to clash with).
+    """
+    if ref.shape[0] == 0:
+        return float("inf")
+    return float(torch.cdist(z, ref).min())
+
+
+def _enforce_min_distance(candidates, avoid, acqf, bounds, min_dist,
+                          num_restarts, raw_samples):
+    """Diversify a proposed batch so no vector sits within ``min_dist`` (L2) of an
+    already-evaluated point or of another accepted member of the same batch.
+
+    Candidates that already clear ``min_dist`` are kept untouched, so when there
+    is no collapse this is a no-op with no behavior change. Each *violating*
+    candidate is swapped for the highest-acquisition point that clears the
+    threshold, drawn from a pool of qNEHVI local optima (``optimize_acqf`` with
+    ``return_best_only=False``) and, only if that is exhausted, from random
+    in-bounds points.
+
+    Args:
+        candidates: ``(q, d)`` tensor returned by ``optimize_acqf``.
+        avoid: ``(M, d)`` tensor of points to stay away from (already-evaluated
+            latent vectors). The accepted batch members are appended as we go.
+        acqf: the built acquisition function (reused to draw the optima pool).
+        bounds: ``(2, d)`` latent box.
+        min_dist: minimum L2 separation to enforce.
+        num_restarts, raw_samples: settings for the pool's ``optimize_acqf`` call.
+
+    Returns:
+        A ``(q, d)`` tensor: the diversified batch.
+    """
+    q, d = candidates.shape
+    ref = avoid.clone()          # grows as batch members are accepted
+    accepted = []
+    pool = None                  # lazily built: acqf optima sorted by value desc
+
+    for i in range(q):
+        cand = candidates[i:i + 1]
+        if _nearest_dist(cand, ref) >= min_dist:
+            accepted.append(cand)
+            ref = torch.cat([ref, cand], dim=0)
+            continue
+
+        # This candidate collapsed onto an existing point. Build the replacement
+        # pool once, on demand, ranked by acquisition value (best first).
+        if pool is None:
+            pool_c, pool_v = optimize_acqf(
+                acq_function=acqf, bounds=bounds, q=1,
+                num_restarts=int(num_restarts), raw_samples=int(raw_samples),
+                return_best_only=False,
+            )
+            order = torch.argsort(pool_v.reshape(-1), descending=True)
+            pool = pool_c.reshape(-1, d)[order]
+
+        replacement = None
+        for p in pool:
+            p = p.unsqueeze(0)
+            if _nearest_dist(p, ref) >= min_dist:
+                replacement = p
+                break
+
+        # Last resort: sample random in-bounds points until one clears min_dist.
+        if replacement is None:
+            lo, hi = bounds[0], bounds[1]
+            for _ in range(1000):
+                p = lo + (hi - lo) * torch.rand(1, d, dtype=candidates.dtype)
+                if _nearest_dist(p, ref) >= min_dist:
+                    replacement = p
+                    break
+        if replacement is None:
+            replacement = cand   # give up (pathological); keep the original
+
+        accepted.append(replacement)
+        ref = torch.cat([ref, replacement], dim=0)
+
+    return torch.cat(accepted, dim=0)
+
+
 def compute_qnehvi(model, train_x, train_y, bounds,
                    batch_size=1, objective_signs=None,
                    n_mc_samples=N_MC_SAMPLES,
                    num_restarts=NUM_RESTARTS, raw_samples=RAW_SAMPLES,
-                   ref_point=None):
+                   ref_point=None, min_dist=DEFAULT_MIN_LATENT_DIST,
+                   avoid_points=None):
     """Optimize qNEHVI over the continuous latent box; return winning vector(s) z.
 
     Builds a noise-robust qNEHVI acquisition on the 5-output ``ModelListGP``
@@ -210,11 +301,19 @@ def compute_qnehvi(model, train_x, train_y, bounds,
         num_restarts, raw_samples: ``optimize_acqf`` multi-start settings.
         ref_point: Optional explicit reference point (weighted frame); defaults to
             ``_weighted_reference_point(train_y, signs)``.
+        min_dist: mode-collapse guard — minimum L2 distance every returned latent
+            vector must keep from ``avoid_points`` and from the rest of the batch
+            (see ``DEFAULT_MIN_LATENT_DIST``). ``0`` disables the guard.
+        avoid_points: points the batch must stay ``min_dist`` away from; defaults
+            to ``train_x`` (the evaluated baseline). Pass the loop's full
+            ``Z_evaluated`` to also avoid latent regions of NaN/penalized points.
 
     Returns:
         A tuple ``(candidates, acq_value)`` where ``candidates`` is a
         ``(batch_size, latent_dim)`` double tensor of latent vectors within
-        ``bounds`` and ``acq_value`` is the scalar acquisition value achieved.
+        ``bounds`` and ``acq_value`` is the scalar acquisition value achieved. When
+        the diversity guard replaces one or more candidates, ``acq_value`` is
+        recomputed on the final (diversified) batch so it reflects what is returned.
     """
     if objective_signs is None:
         objective_signs = _default_signs(N_TASKS)
@@ -252,6 +351,22 @@ def compute_qnehvi(model, train_x, train_y, bounds,
         num_restarts=int(num_restarts),
         raw_samples=int(raw_samples),
     )
+
+    # Mode-collapse guard: reject/replace candidates that landed on top of an
+    # already-evaluated latent coordinate (or on top of each other).
+    if min_dist and float(min_dist) > 0.0:
+        avoid = (X_baseline if avoid_points is None
+                 else torch.as_tensor(avoid_points, dtype=_DTYPE))
+        diversified = _enforce_min_distance(
+            candidates.detach(), avoid, acqf, bounds, float(min_dist),
+            num_restarts, raw_samples,
+        )
+        if not torch.equal(diversified, candidates.detach()):
+            candidates = diversified
+            # Recompute so the reported value matches the batch actually returned.
+            with torch.no_grad():
+                acq_value = acqf(candidates.unsqueeze(0)).squeeze()
+
     return candidates.detach(), acq_value.detach()
 
 
