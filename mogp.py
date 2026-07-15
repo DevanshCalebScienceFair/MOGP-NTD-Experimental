@@ -30,8 +30,24 @@ Half_Life_hours]`` — now ALL five columns carry real predictions.
 Run ``python mogp.py`` for a self-contained demo on random latent data.
 """
 
+# --- macOS OpenMP/BLAS threading-deadlock guard (see loop.py for context) ----
+# The MultiTaskGP (IndexKernel) sparse ops built here can deadlock under macOS
+# multi-threaded BLAS/OpenMP. Pin single-threaded math BEFORE numpy/torch import
+# their runtimes so this module (and its standalone / acquisition.py self-tests)
+# is protected even when loop.py's guard has not run.
+import os
+os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
+
+import warnings
+
 import numpy as np
 import torch
+
+torch.set_num_threads(1)
+warnings.filterwarnings("ignore", message=".*Sparse invariant checks.*")
 
 from botorch.models import SingleTaskGP, ModelListGP, MultiTaskGP
 from botorch.models.transforms.outcome import Standardize
