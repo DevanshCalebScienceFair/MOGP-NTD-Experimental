@@ -12,16 +12,15 @@ Two architectural shifts from the old grey-box design:
     objectives and folded in known-exact ADMET at acquisition time. In the
     generative setting molecules are invented, so their ADMET is *not* known in
     advance — every objective (2 docking + 3 ADMET) is now predicted by the GP.
-  * **Native BoTorch model with coregionalized docking.** The model is a
-    ``ModelListGP`` whose 5 outputs come from: one multi-task ``MultiTaskGP`` that
-    models the two correlated docking objectives JOINTLY (an ICM/coregionalization
-    kernel lets an observation of one DHFR target inform the other), plus three
-    independent ``SingleTaskGP``s for the mechanistically-unrelated ADMET
-    objectives (each ``ScaleKernel(MaternKernel(nu=2.5, ard_num_dims=latent_dim))``
-    + ``Standardize(1)``). All fit with ``fit_gpytorch_mll``. Because it is a
-    first-class BoTorch model, its posterior is differentiable w.r.t. the latent
-    input, so ``optimize_acqf`` can push gradients from the acquisition all the way
-    back to the latent vector ``z``. See ``build_model`` for the layout contract.
+  * **Native BoTorch model.** The model is a ``ModelListGP`` of 5 independent
+    ``SingleTaskGP``s, each with a ``ScaleKernel(MaternKernel(nu=2.5,
+    ard_num_dims=latent_dim))`` and a per-output ``Standardize(1)`` outcome
+    transform, fit with ``fit_gpytorch_mll``. Because it is a first-class BoTorch
+    model, its posterior is differentiable w.r.t. the latent input, so
+    ``optimize_acqf`` can push gradients from the acquisition all the way back to
+    the latent vector ``z``. (An earlier coregionalized ``MultiTaskGP`` for the two
+    docking targets was reverted — its sparse gradients deadlock autograd on Apple
+    Silicon; see ``build_model``.)
 
 Predictions are returned in the fixed ``TASK_NAMES`` order
 ``[PfDHFR_Docking, hDHFR_Docking, hERG_Toxicity_Prob, Caco2_logPapp,
@@ -30,26 +29,10 @@ Half_Life_hours]`` — now ALL five columns carry real predictions.
 Run ``python mogp.py`` for a self-contained demo on random latent data.
 """
 
-# --- macOS OpenMP/BLAS threading-deadlock guard (see loop.py for context) ----
-# The MultiTaskGP (IndexKernel) sparse ops built here can deadlock under macOS
-# multi-threaded BLAS/OpenMP. Pin single-threaded math BEFORE numpy/torch import
-# their runtimes so this module (and its standalone / acquisition.py self-tests)
-# is protected even when loop.py's guard has not run.
-import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-
-import warnings
-
 import numpy as np
 import torch
 
-torch.set_num_threads(1)
-warnings.filterwarnings("ignore", message=".*Sparse invariant checks.*")
-
-from botorch.models import SingleTaskGP, ModelListGP, MultiTaskGP
+from botorch.models import SingleTaskGP, ModelListGP
 from botorch.models.transforms.outcome import Standardize
 from botorch.fit import fit_gpytorch_mll
 from gpytorch.mlls import SumMarginalLogLikelihood
@@ -155,26 +138,19 @@ def _single_task_gp(X, y_col, latent_dim):
 
 
 def build_model(train_x, train_y):
-    """Construct (untrained) the coregionalized ``ModelListGP`` over latent space.
+    """Construct (untrained) the ``ModelListGP`` of 5 independent ``SingleTaskGP``s.
 
-    The two DOCKING objectives (PfDHFR vs. hDHFR) are biologically correlated —
-    both measure binding to a dihydrofolate reductase — so they are modelled
-    JOINTLY by a single coregionalized (multi-task) GP that shares information
-    across the two targets through a learned inter-task covariance. Concretely a
-    ``MultiTaskGP`` with an ICM/coregionalization kernel
-    ``data_kernel(x) * task_kernel(task)``: a Matern kernel over the latent inputs
-    multiplied by a positive-correlation ``IndexKernel`` over the two task ids, so
-    an observation of one target informs the posterior of the other.
+    Every objective — the two docking targets (PfDHFR, hDHFR) and the three ADMET
+    tasks — is modelled by its OWN independent ``SingleTaskGP`` (``ScaleKernel(
+    MaternKernel(nu=2.5, ard_num_dims=latent_dim))`` + ``Standardize(1)``), bundled
+    into a ``ModelListGP`` whose outputs stay in ``TASK_NAMES`` order.
 
-    The three ADMET objectives (hERG, Caco2, half-life) are mechanistically
-    unrelated to each other and to docking, so each stays an INDEPENDENT
-    ``SingleTaskGP`` exactly as before.
-
-    All submodels are bundled into one ``ModelListGP`` whose concatenated outputs
-    stay in ``TASK_NAMES`` order, so ``optimize_acqf`` / qNEHVI see a single
-    5-output model. This requires the docking tasks to occupy the LEADING
-    contiguous block of ``TASK_NAMES`` and ADMET the trailing block (true in this
-    repo: docking = 0,1; ADMET = 2,3,4); a reorder is rejected loudly below.
+    NOTE: An earlier version modelled the two docking objectives jointly with a
+    coregionalized ``MultiTaskGP`` (ICM ``IndexKernel``). That was reverted: its
+    sparse gradients deadlock PyTorch's autograd engine during ``run_backward()``
+    inside ``optimize_acqf`` on Apple-Silicon CPUs. Independent ``SingleTaskGP``s
+    have no such sparse path and are rock-solid; the (modest) statistical benefit of
+    sharing the docking covariance is not worth freezing the overnight campaign.
 
     Args:
         train_x: Latent-vector tensor/array of shape ``(N, latent_dim)``.
@@ -183,9 +159,7 @@ def build_model(train_x, train_y):
             filters failed evaluations before calling.
 
     Returns:
-        An unfitted ``ModelListGP``: ``[MultiTaskGP(docking, 2-output)]`` followed
-        by one ``SingleTaskGP`` per ADMET objective. When there are not exactly two
-        docking tasks it degrades gracefully to all-independent ``SingleTaskGP``s.
+        An unfitted ``ModelListGP`` of ``N_TASKS`` independent ``SingleTaskGP``s.
     """
     X = torch.as_tensor(train_x, dtype=_DTYPE)
     Y = torch.as_tensor(train_y, dtype=_DTYPE)
@@ -202,58 +176,9 @@ def build_model(train_x, train_y):
         )
 
     latent_dim = X.shape[-1]
-    dock_idx = DOCKING_TASK_INDICES
-    admet_idx = ADMET_TASK_INDICES
-
-    # Fall back to the original all-independent design unless there are exactly
-    # two docking tasks forming the leading block (with ADMET as the trailing
-    # block), which is the only layout for which the coregionalized ModelListGP
-    # output order provably matches TASK_NAMES.
-    coregionalize = (
-        len(dock_idx) == 2
-        and dock_idx == list(range(len(dock_idx)))
-        and admet_idx == list(range(len(dock_idx), N_TASKS))
-    )
-    if not coregionalize:
-        models = [_single_task_gp(X, Y[:, i : i + 1], latent_dim)
-                  for i in range(N_TASKS)]
-        return ModelListGP(*models)
-
-    # Coregionalized GP over the two correlated docking tasks. MultiTaskGP wants
-    # task-augmented training data: each latent point appears once per task with a
-    # trailing task-id column. Outputs are requested via output_tasks=[0, 1], so
-    # the 2-output posterior lands in [PfDHFR, hDHFR] == TASK_NAMES[0:2] order.
-    #
-    # NOTE: outcome_transform=None. MultiTaskGP would otherwise apply a DEFAULT
-    # Standardize, whose untransformed posterior does not expose the ``.distribution``
-    # that ModelListGP's multi-output combine path needs; raw docking kcal (~-10..0)
-    # is already well-scaled and the per-task mean absorbs the offset, matching the
-    # Standardize-untransformed ADMET GPs (predictions stay in ORIGINAL units).
-    Y_dock = Y[:, dock_idx]                                    # (N, 2)
-    n = X.shape[0]
-    task_col_0 = torch.zeros(n, 1, dtype=_DTYPE)
-    task_col_1 = torch.ones(n, 1, dtype=_DTYPE)
-    X_aug = torch.cat(
-        [torch.cat([X, task_col_0], dim=-1), torch.cat([X, task_col_1], dim=-1)],
-        dim=0,
-    )                                                          # (2N, latent_dim+1)
-    Y_aug = torch.cat([Y_dock[:, 0:1], Y_dock[:, 1:2]], dim=0)  # (2N, 1)
-    dock_gp = MultiTaskGP(
-        X_aug,
-        Y_aug,
-        task_feature=latent_dim,          # the appended task-id column
-        output_tasks=[0, 1],
-        rank=len(dock_idx),               # full-rank 2x2 inter-task covariance
-        covar_module=MaternKernel(nu=2.5, ard_num_dims=latent_dim),
-        outcome_transform=None,
-    )
-
-    # Independent GPs for the three ADMET tasks (outputs land at indices 2,3,4).
-    admet_gps = [_single_task_gp(X, Y[:, j : j + 1], latent_dim) for j in admet_idx]
-
-    # ModelListGP concatenates submodel outputs in order -> [0,1] then [2,3,4],
-    # i.e. exactly TASK_NAMES order for the downstream acquisition.
-    return ModelListGP(dock_gp, *admet_gps)
+    models = [_single_task_gp(X, Y[:, i : i + 1], latent_dim)
+              for i in range(N_TASKS)]
+    return ModelListGP(*models)
 
 
 def train_mogp(train_x, train_y, n_iterations=None, lr=None):

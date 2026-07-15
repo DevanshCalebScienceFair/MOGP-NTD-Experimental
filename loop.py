@@ -38,32 +38,14 @@ initialization, so it is monotone within a run.
 Run ``python loop.py --help`` for the command-line options.
 """
 
-# --- macOS OpenMP/BLAS threading-deadlock guard -----------------------------
-# BoTorch's MultiTaskGP (IndexKernel) drives sparse linear-algebra ops that can
-# deadlock under macOS's duplicate-libomp / multi-threaded BLAS situation
-# (observed: the Grand Campaign froze for an hour inside "[Iteration 1] Training
-# latent GP..." right after the torch sparse-invariant warning). Forcing
-# single-threaded math sidesteps it, and docking dominates runtime anyway. These
-# env vars MUST be set BEFORE numpy/torch import their threading runtimes.
 import os
-os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
-os.environ.setdefault("OMP_NUM_THREADS", "1")
-os.environ.setdefault("MKL_NUM_THREADS", "1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
-
 import sys
 import time
 import argparse
-import warnings
 
 import numpy as np
 import torch
 import pandas as pd
-
-# Pin PyTorch's intra-op thread pool to a single thread (the actual deadlock fix)
-# and silence the benign sparse-invariant-checks warning the IndexKernel emits.
-torch.set_num_threads(1)
-warnings.filterwarnings("ignore", message=".*Sparse invariant checks.*")
 
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen, Lipinski, QED

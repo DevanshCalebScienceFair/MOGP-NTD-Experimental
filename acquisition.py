@@ -342,13 +342,6 @@ def compute_qnehvi(model, train_x, train_y, bounds,
         sampler=sampler,
         objective=objective,
         prune_baseline=True,
-        # cache_root=False for robustness with the coregionalized docking GP
-        # (mogp now bundles a multi-task MultiTaskGP into the ModelListGP). qNEHVI's
-        # cached root-decomposition of the baseline posterior is brittle for
-        # multi-task submodels under optimize_acqf's batched gradients; disabling
-        # the cache is always correct — only marginally slower — and time is not a
-        # constraint for the production run.
-        cache_root=False,
     )
 
     candidates, acq_value = optimize_acqf(
