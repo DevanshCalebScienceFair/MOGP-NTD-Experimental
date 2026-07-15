@@ -56,6 +56,15 @@ RDLogger.DisableLog("rdApp.*")
 DEFAULT_WEIGHTS_PATH = "models/vae/selfies_vae.pt"
 DEFAULT_LIBRARY_DIR = "data/library"
 
+# Larger training corpus. The 601-molecule library gives the VAE a tiny SELFIES
+# vocabulary, which chokes the search once the biological filters bite. If the raw
+# ChEMBL pull is present we curate a much larger drug-like corpus from it (cached
+# to CORPUS_DIR) to expand the latent chemical universe; otherwise we fall back to
+# the small library. See LatentSpaceBridge._resolve_training_smiles.
+CHEMBL_SOURCE = "data/chembl_v29.csv"      # raw ChEMBL_V29 pull: columns ID,smiles
+CORPUS_DIR = "data/vae_train"              # curated drug-like corpus cache
+DEFAULT_CORPUS_SIZE = 5000                 # target number of training molecules
+
 # SELFIES padding / no-op symbol (decoder ignores it), reserved to index 0.
 PAD_SYMBOL = "[nop]"
 
@@ -176,11 +185,13 @@ class LatentSpaceBridge:
                  max_len=DEFAULT_MAX_LEN,
                  weights_path=DEFAULT_WEIGHTS_PATH,
                  library_dir=DEFAULT_LIBRARY_DIR,
+                 corpus_size=DEFAULT_CORPUS_SIZE,
                  device="cpu", n_epochs=120, batch_size=64, lr=1e-3, seed=42,
                  dtype=torch.double):
         self.latent_dim = int(latent_dim)
         self.low = float(low)
         self.high = float(high)
+        self.corpus_size = int(corpus_size)
         # Fixed structural budget on SELFIES length. A cached checkpoint trained
         # under a DIFFERENT max_len is considered stale (see _can_load), so changing
         # this value automatically triggers a one-time retrain.
@@ -373,18 +384,95 @@ class LatentSpaceBridge:
     # ------------------------------------------------------------------ #
     # Training (first run only)
     # ------------------------------------------------------------------ #
-    def _load_library_smiles(self, library_dir):
-        """Read the training SMILES from ``<library_dir>/smiles.csv``."""
+    @staticmethod
+    def _read_smiles_csv(path):
+        """Read a SMILES column (``SMILES`` or first column) from a CSV."""
         import pandas as pd
-        path = os.path.join(library_dir, "smiles.csv")
-        if not os.path.exists(path):
-            raise FileNotFoundError(
-                f"[VAE] Cannot train: no SMILES library at {path}. Build it with "
-                "`python data.py` first, or pass an existing library_dir."
-            )
         df = pd.read_csv(path)
         col = "SMILES" if "SMILES" in df.columns else df.columns[0]
         return [str(s) for s in df[col].tolist()]
+
+    def _build_corpus_from_chembl(self, src, out_path, seed=42):
+        """Curate a drug-like training corpus of ~``corpus_size`` SMILES from ChEMBL.
+
+        The raw ChEMBL pull spans everything from small fragments to giant peptides.
+        We sample a shuffled candidate pool and keep only molecules that are:
+        RDKit-parseable, within the Lipinski MW/LogP envelope, not too large
+        (heavy-atom bound), and — critically — SELFIES-encodable within the
+        ``max_len`` token budget (so no training molecule is truncated). The result
+        is canonicalized, de-duplicated, and cached to ``out_path``.
+        """
+        import pandas as pd
+        from rdkit.Chem import Descriptors, Crippen
+
+        print(f"[VAE] Curating a drug-like training corpus (target "
+              f"{self.corpus_size}) from {src} ...")
+        df = pd.read_csv(src)
+        col = "smiles" if "smiles" in df.columns else (
+            "SMILES" if "SMILES" in df.columns else df.columns[-1])
+        series = df[col].dropna().astype(str)
+
+        # Shuffle a candidate pool for chemical diversity; scan until the target is
+        # met (a generous pool covers the ~drug-like acceptance rate).
+        rng = np.random.default_rng(seed)
+        pool_n = min(len(series), max(60000, self.corpus_size * 12))
+        pool = series.sample(n=pool_n, random_state=seed).tolist()
+
+        kept = []
+        seen = set()
+        for smi in pool:
+            mol = Chem.MolFromSmiles(smi)
+            if mol is None:
+                continue
+            if mol.GetNumHeavyAtoms() > 45:
+                continue
+            if Descriptors.MolWt(mol) > 500.0 or Crippen.MolLogP(mol) > 5.0:
+                continue
+            canon = Chem.MolToSmiles(mol)
+            if canon in seen:
+                continue
+            try:
+                s = sf.encoder(canon)
+            except Exception:
+                s = None
+            if s is None or sf.len_selfies(s) > self.max_len:
+                continue
+            seen.add(canon)
+            kept.append(canon)
+            if len(kept) >= self.corpus_size:
+                break
+
+        if not kept:
+            raise RuntimeError(
+                f"[VAE] ChEMBL corpus build from {src} yielded no drug-like, "
+                "within-budget molecules; check the source file."
+            )
+        os.makedirs(os.path.dirname(out_path), exist_ok=True)
+        pd.DataFrame({"SMILES": kept}).to_csv(out_path, index=False)
+        print(f"[VAE] Cached {len(kept)} drug-like training molecules to {out_path}.")
+        return kept
+
+    def _resolve_training_smiles(self, library_dir):
+        """Return the training SMILES, preferring the largest available corpus.
+
+        Priority: (1) a previously curated corpus at ``CORPUS_DIR/smiles.csv``;
+        (2) freshly curated from ``CHEMBL_SOURCE`` if that raw pull exists;
+        (3) the small ``<library_dir>/smiles.csv`` fallback.
+        """
+        corpus_path = os.path.join(CORPUS_DIR, "smiles.csv")
+        if os.path.exists(corpus_path):
+            print(f"[VAE] Using cached training corpus at {corpus_path}.")
+            return self._read_smiles_csv(corpus_path)
+        if os.path.exists(CHEMBL_SOURCE):
+            return self._build_corpus_from_chembl(CHEMBL_SOURCE, corpus_path)
+        fallback = os.path.join(library_dir, "smiles.csv")
+        if not os.path.exists(fallback):
+            raise FileNotFoundError(
+                f"[VAE] Cannot train: no curated corpus, no {CHEMBL_SOURCE}, and no "
+                f"library at {fallback}. Build one with `python data.py` first."
+            )
+        print(f"[VAE] ChEMBL source absent; falling back to small library {fallback}.")
+        return self._read_smiles_csv(fallback)
 
     def _build_vocab(self, selfies_list):
         """Build symbol<->id maps from a list of SELFIES strings.
@@ -411,8 +499,8 @@ class LatentSpaceBridge:
         np.random.seed(seed)
 
         print(f"[VAE] No cached checkpoint at {weights_path}; training a fresh "
-              f"SELFIES-VAE on {library_dir} ...")
-        raw_smiles = self._load_library_smiles(library_dir)
+              f"SELFIES-VAE ...")
+        raw_smiles = self._resolve_training_smiles(library_dir)
 
         # SMILES -> SELFIES (skip anything SELFIES can't represent).
         selfies_list = []

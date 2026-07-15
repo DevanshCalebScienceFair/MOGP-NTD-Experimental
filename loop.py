@@ -104,18 +104,20 @@ _SIGNS = np.asarray(DEFAULT_OBJECTIVE_SIGNS, dtype=float)
 # dock. Oversized / non-drug-like molecules (which a generative VAE readily
 # proposes, and which are slow to dock and out of the ADMET oracle's domain) are
 # rejected here, never docked, and given a penalty objective row instead.
-MAX_HEAVY_ATOMS = 35
-MW_MAX = 500.0          # Lipinski molecular weight
-LOGP_MAX = 5.0          # Lipinski cLogP
-HBD_MAX = 5             # Lipinski H-bond donors
-HBA_MAX = 10            # Lipinski H-bond acceptors
+MAX_HEAVY_ATOMS = 45    # widened 35->45: give the optimizer room for larger,
+                        # high-potency scaffolds before penalties bite
+MW_MAX = 500.0          # Lipinski molecular weight (retained)
+LOGP_MAX = 5.0          # Lipinski cLogP (retained)
+HBD_MAX = 5             # Lipinski H-bond donors (retained)
+HBA_MAX = 10            # Lipinski H-bond acceptors (retained)
 
 # Synthesizability / drug-likeness gate — deliberately GENEROUS so we never throw
 # away a highly potent scaffold just because it is a bit awkward to synthesize.
 # Only one of these applies, depending on which metric imported above:
-#   SA score : reject if > SA_SCORE_MAX (typical marketed drugs sit ~2-5; 6 is lax)
+#   SA score : reject if > SA_SCORE_MAX (typical marketed drugs sit ~2-5; 7.2 is
+#              very lax, letting highly active but slightly complex scaffolds survive)
 #   QED      : reject if < QED_MIN      (0.3 keeps all but clearly non-drug-like mols)
-SA_SCORE_MAX = 6.0
+SA_SCORE_MAX = 7.2
 QED_MIN = 0.3
 
 # Penalty objective row assigned to a REJECTED molecule (TASK_NAMES order). Each
@@ -161,7 +163,7 @@ class BOLoop:
 
     def __init__(self, seed=42, latent_dim=50,
                  n_init=10, batch_size=5, n_iterations=10,
-                 mogp_train_iters=200, mogp_lr=0.1, epsilon=EPSILON_GREEDY,
+                 mogp_train_iters=80, mogp_lr=0.1, epsilon=EPSILON_GREEDY,
                  bridge=None, oracle=None, train_fn=None):
         # --- Reproducibility ---
         self.seed = seed
@@ -559,13 +561,14 @@ if __name__ == "__main__":
         description="Run the latent-space (de-novo) BO loop for PfDHFR drug discovery."
     )
     parser.add_argument("--latent-dim", type=int, default=50)
-    # Production campaign defaults: with a ~15% random pre-dock pass rate, n_init=40
-    # yields ~5-6 real (docked) anchor molecules before qNEHVI takes over, and
-    # n_iterations=20 x batch_size=3 gives a substantive de-novo search.
+    # "Overnight Grand Campaign" production defaults: a deep 50-iteration de-novo
+    # search sized for a manageable multi-hour autonomous run. n_init=40 seeds the
+    # GP, then n_iterations=50 x batch_size=5 drives the search; mogp_iters=80 caps
+    # each GP fit's optimizer iterations to accelerate per-iteration training.
     parser.add_argument("--n-init", type=int, default=40)
-    parser.add_argument("--batch-size", type=int, default=3)
-    parser.add_argument("--n-iterations", type=int, default=20)
-    parser.add_argument("--mogp-iters", type=int, default=200)
+    parser.add_argument("--batch-size", type=int, default=5)
+    parser.add_argument("--n-iterations", type=int, default=50)
+    parser.add_argument("--mogp-iters", type=int, default=80)
     parser.add_argument("--epsilon", type=float, default=EPSILON_GREEDY,
                         help="epsilon-greedy wildcard probability per BO step "
                              "(0 disables random-exploration steps)")

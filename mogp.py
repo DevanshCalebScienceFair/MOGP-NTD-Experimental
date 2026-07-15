@@ -247,9 +247,12 @@ def train_mogp(train_x, train_y, n_iterations=None, lr=None):
         train_x: Latent vectors, shape ``(N, latent_dim)``.
         train_y: Targets, shape ``(N, N_TASKS)`` in ``TASK_NAMES`` order,
             fully observed.
-        n_iterations, lr: Accepted for signature compatibility with the old
-            Adam-based trainer and IGNORED — ``fit_gpytorch_mll`` uses BoTorch's
-            default (scipy L-BFGS-B) fit, which needs neither.
+        n_iterations: Caps the scipy L-BFGS-B optimizer's iteration budget
+            (``options={"maxiter": n_iterations}``). Lower values trade a little
+            fit precision for faster per-iteration GP training — the lever the
+            overnight campaign uses (e.g. 80). ``None`` uses BoTorch's default.
+        lr: Accepted for signature compatibility with the old Adam-based trainer
+            and IGNORED (scipy L-BFGS-B does not use a learning rate).
 
     Returns:
         The fitted ``ModelListGP``. (The old ``(model, likelihood, y_mean, y_std)``
@@ -258,7 +261,11 @@ def train_mogp(train_x, train_y, n_iterations=None, lr=None):
     """
     model = build_model(train_x, train_y)
     mll = SumMarginalLogLikelihood(model.likelihood, model)
-    fit_gpytorch_mll(mll)
+    optimizer_kwargs = None
+    if n_iterations is not None:
+        # Cap the L-BFGS-B iteration count so larger-N fits stay fast at scale.
+        optimizer_kwargs = {"options": {"maxiter": int(n_iterations)}}
+    fit_gpytorch_mll(mll, optimizer_kwargs=optimizer_kwargs)
     return model
 
 
