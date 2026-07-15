@@ -46,6 +46,9 @@ import numpy as np
 import torch
 import pandas as pd
 
+from rdkit import Chem
+from rdkit.Chem import Descriptors, Crippen, Lipinski
+
 from botorch.utils.multi_objective.hypervolume import Hypervolume
 
 from vae_bridge import LatentSpaceBridge
@@ -66,6 +69,33 @@ from docking import batch_dock_targets, docked_summary
 # molecule: two docking targets (expensive) + three ADMET oracle columns (cheap).
 ADMET_TASKS, DOCKING_TASKS, DOCKING_TARGETS = resolve_objective_layout()
 _SIGNS = np.asarray(DEFAULT_OBJECTIVE_SIGNS, dtype=float)
+
+
+# --- Pre-dock structural filter (Lipinski Ro5 + a heavy-atom cap) ------------
+# A cheap RDKit screen applied to every decoded molecule BEFORE the expensive
+# dock. Oversized / non-drug-like molecules (which a generative VAE readily
+# proposes, and which are slow to dock and out of the ADMET oracle's domain) are
+# rejected here, never docked, and given a penalty objective row instead.
+MAX_HEAVY_ATOMS = 35
+MW_MAX = 500.0          # Lipinski molecular weight
+LOGP_MAX = 5.0          # Lipinski cLogP
+HBD_MAX = 5             # Lipinski H-bond donors
+HBA_MAX = 10            # Lipinski H-bond acceptors
+
+# Penalty objective row assigned to a REJECTED molecule (TASK_NAMES order). Each
+# value is directionally the WORST outcome for its objective given
+# DEFAULT_OBJECTIVE_SIGNS = [-1, +1, -1, +1, +1], so a rejected point is dominated
+# by any real molecule and never joins the Pareto front / earns hypervolume. The
+# magnitudes are deliberately "worse than any realistic molecule" but BOUNDED
+# (not +/-inf): the GP fits on these rows so the MOGP learns to avoid the latent
+# region, and wildly extreme values would blow up each objective's Standardize
+# normalization and swamp the signal from real molecules.
+#   PfDHFR_Docking (min)  ->  0.0    : ~no parasite binding (worst)
+#   hDHFR_Docking  (max)  -> -14.0   : very strong human binding (worst selectivity)
+#   hERG_Tox_Prob  (min)  ->  1.0    : certain hERG blocker
+#   Caco2_logPapp  (max)  -> -8.0    : very poor permeability
+#   Half_Life_hours(max)  ->  0.0    : ~zero half-life
+REJECTION_PENALTY = np.array([0.0, -14.0, 1.0, -8.0, 0.0], dtype=np.float64)
 
 
 class BOLoop:
@@ -120,29 +150,79 @@ class BOLoop:
     # ------------------------------------------------------------------ #
     # Evaluation helper
     # ------------------------------------------------------------------ #
-    def _evaluate(self, smiles_list):
-        """Score decoded SMILES on all 5 objectives (ORIGINAL units).
+    @staticmethod
+    def _screen(smiles):
+        """Cheap RDKit drug-likeness screen. Returns ``(passed, reason)``.
 
-        Runs the ADMET oracle (3 objectives) and docks against every required
-        target (2 objectives). Failed docks / un-featurizable molecules leave NaN
-        in the affected columns.
+        Rejects molecules that are unparseable, exceed ``MAX_HEAVY_ATOMS``, or
+        violate the Lipinski Rule-of-Five thresholds (MW, cLogP, HBD, HBA).
+        """
+        mol = Chem.MolFromSmiles(smiles) if smiles else None
+        if mol is None:
+            return False, "unparseable"
+        if mol.GetNumHeavyAtoms() > MAX_HEAVY_ATOMS:
+            return False, f"heavy_atoms>{MAX_HEAVY_ATOMS}"
+        if Descriptors.MolWt(mol) > MW_MAX:
+            return False, f"MW>{MW_MAX:g}"
+        if Crippen.MolLogP(mol) > LOGP_MAX:
+            return False, f"LogP>{LOGP_MAX:g}"
+        if Lipinski.NumHDonors(mol) > HBD_MAX:
+            return False, f"HBD>{HBD_MAX}"
+        if Lipinski.NumHAcceptors(mol) > HBA_MAX:
+            return False, f"HBA>{HBA_MAX}"
+        return True, "ok"
+
+    def _evaluate(self, smiles_list):
+        """Screen, then score surviving decoded SMILES on all 5 objectives.
+
+        Each molecule is first passed through the cheap ``_screen`` filter.
+        REJECTED molecules are NOT docked (saving the expensive step); they get
+        the fixed ``REJECTION_PENALTY`` objective row so the GP learns to avoid
+        that latent region. SURVIVORS are scored normally: ADMET oracle (3
+        objectives) + docking against every target (2 objectives); a failed dock /
+        un-featurizable survivor leaves NaN (excluded from GP training later).
 
         Returns:
-            A tuple ``(Y, docking_by_target)`` where ``Y`` has shape
-            ``(len(smiles_list), N_TASKS)`` with columns in ``TASK_NAMES`` order,
-            and ``docking_by_target`` maps each target name to its ``(k,)`` raw
-            affinity vector.
+            A tuple ``(Y, docking_by_target, rejections)`` where ``Y`` has shape
+            ``(len(smiles_list), N_TASKS)`` in ``TASK_NAMES`` order,
+            ``docking_by_target`` maps each target to its ``(N,)`` raw affinity
+            vector (NaN for rejected/failed), and ``rejections`` is a list of
+            ``(index, smiles, reason)`` for the filtered-out molecules.
         """
         smiles_list = list(smiles_list)
-        admet_df = self.oracle.predict(smiles_list)
-        docking_by_target = batch_dock_targets(smiles_list, self.docking_targets)
+        n = len(smiles_list)
+        Y = np.full((n, N_TASKS), np.nan, dtype=np.float64)
+        docking_by_target = {
+            t: np.full(n, np.nan, dtype=np.float64) for t in self.docking_targets
+        }
 
-        Y = np.full((len(smiles_list), N_TASKS), np.nan, dtype=np.float64)
-        for j, col in self.admet_tasks:
-            Y[:, j] = admet_df[col].to_numpy(dtype=float)
-        for j, target in self.docking_tasks:
-            Y[:, j] = np.asarray(docking_by_target[target], dtype=float)
-        return Y, docking_by_target
+        # --- Cheap structural screen: partition into survivors vs rejections ---
+        passed_local = []
+        rejections = []
+        for i, smi in enumerate(smiles_list):
+            ok, reason = self._screen(smi)
+            if ok:
+                passed_local.append(i)
+            else:
+                Y[i, :] = REJECTION_PENALTY   # dominated penalty row; no docking
+                rejections.append((i, smi, reason))
+
+        # --- Only survivors reach the expensive oracles ---
+        if passed_local:
+            passed_smiles = [smiles_list[i] for i in passed_local]
+            admet_df = self.oracle.predict(passed_smiles)
+            admet_vals = {
+                col: admet_df[col].to_numpy(dtype=float) for _, col in self.admet_tasks
+            }
+            dock_pass = batch_dock_targets(passed_smiles, self.docking_targets)
+            for k, i in enumerate(passed_local):
+                for j, col in self.admet_tasks:
+                    Y[i, j] = admet_vals[col][k]
+                for j, target in self.docking_tasks:
+                    val = float(dock_pass[target][k])
+                    Y[i, j] = val
+                    docking_by_target[target][i] = val
+        return Y, docking_by_target, rejections
 
     def _append(self, Z_new, smiles_new, Y_new):
         """Append a batch of (latent, SMILES, objective) records to loop state."""
@@ -199,7 +279,7 @@ class BOLoop:
 
         print(f"Initializing with {self.n_init} random latent vectors "
               f"(dim={self.latent_dim})...")
-        Y0, docking = self._evaluate(smiles0)
+        Y0, docking, rejections = self._evaluate(smiles0)
         self._append(Z0, smiles0, Y0)
 
         # Fix the hypervolume reference point from the initial batch, in the signed
@@ -211,6 +291,7 @@ class BOLoop:
         self.hv_ref_point = col_min - (0.1 * col_range + 1e-6)
 
         print(f"Initialized {self.n_init} molecules; "
+              f"{len(rejections)} rejected pre-dock, "
               f"docked {docked_summary(docking, self.n_init)}.")
 
     def step(self):
@@ -239,8 +320,9 @@ class BOLoop:
         # --- Decode the winning latent vectors into brand-new molecules ---
         smiles_new = self.bridge.decode(candidates)
 
-        # --- Evaluate the decoded molecules on all 5 objectives ---
-        Y_new, docking_new = self._evaluate(smiles_new)
+        # --- Evaluate the decoded molecules on all 5 objectives (screen first) ---
+        Y_new, docking_new, rejections = self._evaluate(smiles_new)
+        n_rejected = len(rejections)
         batch_docked = docked_summary(docking_new, len(smiles_new))
         self._append(Z_new, smiles_new, Y_new)
 
@@ -252,6 +334,7 @@ class BOLoop:
         self.history.append({
             "iteration": iteration,
             "n_evaluated": len(self.Y_evaluated),
+            "n_rejected": n_rejected,
             "pareto_size": pareto_size,
             "hypervolume": hypervolume,
             "acq_value": float(acq_value),
@@ -260,7 +343,7 @@ class BOLoop:
 
         print(f"[Iteration {iteration}] "
               f"evaluated={len(self.Y_evaluated)}, "
-              f"batch={len(smiles_new)}, "
+              f"batch={len(smiles_new)}, rejected_pre_dock={n_rejected}, "
               f"docked_this_batch=[{batch_docked}], "
               f"pareto_size={pareto_size}, hypervolume={hypervolume:.4f}, "
               f"acq_value={float(acq_value):.4f}")
@@ -302,6 +385,7 @@ class BOLoop:
             {
                 "iteration": h["iteration"],
                 "n_evaluated": h["n_evaluated"],
+                "n_rejected": h.get("n_rejected", 0),
                 "pareto_size": h["pareto_size"],
                 "hypervolume": h["hypervolume"],
                 "acq_value": h.get("acq_value", float("nan")),
@@ -341,9 +425,12 @@ if __name__ == "__main__":
         description="Run the latent-space (de-novo) BO loop for PfDHFR drug discovery."
     )
     parser.add_argument("--latent-dim", type=int, default=50)
-    parser.add_argument("--n-init", type=int, default=10)
-    parser.add_argument("--batch-size", type=int, default=5)
-    parser.add_argument("--n-iterations", type=int, default=10)
+    # Production campaign defaults: with a ~15% random pre-dock pass rate, n_init=40
+    # yields ~5-6 real (docked) anchor molecules before qNEHVI takes over, and
+    # n_iterations=20 x batch_size=3 gives a substantive de-novo search.
+    parser.add_argument("--n-init", type=int, default=40)
+    parser.add_argument("--batch-size", type=int, default=3)
+    parser.add_argument("--n-iterations", type=int, default=20)
     parser.add_argument("--mogp-iters", type=int, default=200)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results")
@@ -351,7 +438,7 @@ if __name__ == "__main__":
 
     start = time.time()
 
-    print("Running latent-space BO loop (mock VAE bridge).")
+    print("Running latent-space (de-novo) BO loop with the SELFIES-VAE bridge.")
     loop = BOLoop(
         seed=args.seed,
         latent_dim=args.latent_dim,
