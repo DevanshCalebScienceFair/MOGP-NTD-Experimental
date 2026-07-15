@@ -49,6 +49,15 @@ import pandas as pd
 
 from rdkit import Chem
 from rdkit.Chem import Descriptors, Crippen, Lipinski, QED
+from rdkit.Chem.FilterCatalog import FilterCatalog, FilterCatalogParams
+
+# PAINS (Pan-Assay INterference compoundS) substructure catalog, built once. These
+# promiscuous scaffolds hit many unrelated assays and are classic false-positive
+# "hits"; any decoded molecule matching one is vetoed before docking so the Pareto
+# front holds only biologically credible candidates.
+_pains_params = FilterCatalogParams()
+_pains_params.AddCatalog(FilterCatalogParams.FilterCatalogs.PAINS)
+_PAINS_CATALOG = FilterCatalog(_pains_params)
 
 # --- Synthesizability metric (contrib import, handled cleanly) --------------
 # Prefer Ertl's Synthetic Accessibility (SA) score (1 = easy .. 10 = hard),
@@ -132,6 +141,13 @@ REJECTION_PENALTY = np.array([0.0, -14.0, 1.0, -8.0, 0.0], dtype=np.float64)
 # any shortfall up to this many rounds before proceeding with what it has.
 MAX_PROPOSAL_ROUNDS = 5
 
+# epsilon-greedy wildcard. With this probability a BO step SKIPS qNEHVI entirely
+# and proposes a batch of purely random (in-bounds) latent vectors. This injects
+# unconditioned exploration so the search can never get permanently pinned in a
+# single basin of the acquisition surface (a local optimum). The molecule-novelty
+# guard still applies to wildcard batches; only the *proposal* mechanism changes.
+EPSILON_GREEDY = 0.1
+
 
 class BOLoop:
     """Latent-space multi-objective Bayesian optimization loop.
@@ -145,7 +161,7 @@ class BOLoop:
 
     def __init__(self, seed=42, latent_dim=50,
                  n_init=10, batch_size=5, n_iterations=10,
-                 mogp_train_iters=200, mogp_lr=0.1,
+                 mogp_train_iters=200, mogp_lr=0.1, epsilon=EPSILON_GREEDY,
                  bridge=None, oracle=None, train_fn=None):
         # --- Reproducibility ---
         self.seed = seed
@@ -172,6 +188,7 @@ class BOLoop:
         self.n_iterations = n_iterations
         self.mogp_train_iters = mogp_train_iters
         self.mogp_lr = mogp_lr
+        self.epsilon = epsilon
 
         # --- Tracking state ---
         # Z_evaluated (N, latent_dim) is the GP's training X; smiles[i] is the
@@ -190,8 +207,9 @@ class BOLoop:
         """Cheap RDKit drug-likeness screen. Returns ``(passed, reason)``.
 
         Rejects molecules that are unparseable, exceed ``MAX_HEAVY_ATOMS``,
-        violate the Lipinski Rule-of-Five thresholds (MW, cLogP, HBD, HBA), or
-        fail a generous synthesizability gate (SA score, or QED as a fallback).
+        violate the Lipinski Rule-of-Five thresholds (MW, cLogP, HBD, HBA), match a
+        PAINS interference substructure, or fail a generous synthesizability gate
+        (SA score, or QED as a fallback).
         """
         mol = Chem.MolFromSmiles(smiles) if smiles else None
         if mol is None:
@@ -206,6 +224,9 @@ class BOLoop:
             return False, f"HBD>{HBD_MAX}"
         if Lipinski.NumHAcceptors(mol) > HBA_MAX:
             return False, f"HBA>{HBA_MAX}"
+        # Chemist's veto: reject pan-assay interference (PAINS) substructures.
+        if _PAINS_CATALOG.HasMatch(mol):
+            return False, "PAINS"
         # Generous synthesizability / drug-likeness gate (SA preferred, QED fallback).
         if sascorer is not None:
             if sascorer.calculateScore(mol) > SA_SCORE_MAX:
@@ -337,37 +358,58 @@ class BOLoop:
               f"{len(rejections)} rejected pre-dock, "
               f"docked {docked_summary(docking, self.n_init)}.")
 
+    def _random_latents(self, n):
+        """Draw ``n`` uniform in-bounds latent vectors as a ``(n, latent_dim)`` tensor."""
+        lo = self.bounds[0]
+        hi = self.bounds[1]
+        u = torch.rand(int(n), self.latent_dim, dtype=lo.dtype)
+        return lo + (hi - lo) * u
+
     def _propose_batch(self, model, Z_train, Y_train):
         """Propose the next batch of (latent vector, decoded SMILES) pairs.
 
-        Diversity is enforced at TWO levels. ``compute_qnehvi`` enforces LATENT
-        distance (no two z's on the same coordinate); here we additionally enforce
-        MOLECULE novelty, because the many-to-one VAE decoder can map distinct z's
-        to a molecule already evaluated. We over-generate from qNEHVI and greedily
-        keep only novel decodes (vs. every prior molecule and vs. the batch so
-        far), re-querying for any shortfall up to ``MAX_PROPOSAL_ROUNDS`` rounds.
+        With probability ``self.epsilon`` this is an epsilon-greedy WILDCARD step:
+        qNEHVI is bypassed entirely and the batch is drawn from purely random
+        in-bounds latent vectors (unconditioned exploration, so the search can
+        never get permanently trapped in one basin). Otherwise the batch comes from
+        qNEHVI as usual.
 
-        Returns ``(Z_new, smiles_new, acq_value)``. If the decoder is so collapsed
-        that no novel molecule can be found, the batch may be smaller than
-        ``batch_size`` (and, in the degenerate case, falls back to the raw qNEHVI
-        batch) so the campaign never stalls.
+        Either way diversity is enforced at TWO levels: ``compute_qnehvi`` enforces
+        LATENT distance (no two z's on the same coordinate), and here we enforce
+        MOLECULE novelty, because the many-to-one VAE decoder can map distinct z's
+        to a molecule already evaluated. We over-generate and greedily keep only
+        novel decodes (vs. every prior molecule and vs. the batch so far),
+        re-querying for any shortfall up to ``MAX_PROPOSAL_ROUNDS`` rounds.
+
+        Returns ``(Z_new, smiles_new, acq_value)``; ``acq_value`` is ``nan`` on a
+        wildcard step (no acquisition was optimized). If no novel molecule can be
+        found the batch may be smaller than ``batch_size`` (and, in the degenerate
+        case, falls back to a raw batch) so the campaign never stalls.
         """
+        wildcard = float(self.epsilon) > 0.0 and np.random.rand() < float(self.epsilon)
+        if wildcard:
+            print(f"[Iteration {len(self.history) + 1}] epsilon-greedy WILDCARD: "
+                  f"bypassing qNEHVI, injecting random latent exploration.")
+
         seen = set(self.smiles)
         chosen_z, chosen_smiles = [], []
-        last_acq = 0.0
+        last_acq = float("nan") if wildcard else 0.0
         for _ in range(MAX_PROPOSAL_ROUNDS):
             need = self.batch_size - len(chosen_z)
             if need <= 0:
                 break
-            # Avoid every latent point spent so far AND the ones chosen this step.
-            avoid = self.Z_evaluated
-            if chosen_z:
-                avoid = np.vstack([avoid, np.asarray(chosen_z)])
-            candidates, acq_value = compute_qnehvi(
-                model, Z_train, Y_train, self.bounds, batch_size=need,
-                avoid_points=avoid,
-            )
-            last_acq = float(acq_value)
+            if wildcard:
+                candidates = self._random_latents(need)
+            else:
+                # Avoid every latent point spent so far AND those chosen this step.
+                avoid = self.Z_evaluated
+                if chosen_z:
+                    avoid = np.vstack([avoid, np.asarray(chosen_z)])
+                candidates, acq_value = compute_qnehvi(
+                    model, Z_train, Y_train, self.bounds, batch_size=need,
+                    avoid_points=avoid,
+                )
+                last_acq = float(acq_value)
             smi_batch = self.bridge.decode(candidates)
             for z_i, smi_i in zip(candidates.cpu().numpy(), smi_batch):
                 if smi_i in seen:
@@ -379,8 +421,12 @@ class BOLoop:
                     break
 
         if not chosen_z:
-            # Decoder fully collapsed onto known molecules; proceed with the raw
-            # qNEHVI batch rather than stalling (these will be re-evaluated).
+            # Decoder fully collapsed onto known molecules; proceed with a raw
+            # batch rather than stalling (these will be re-evaluated).
+            if wildcard:
+                candidates = self._random_latents(self.batch_size)
+                return (candidates.cpu().numpy(),
+                        list(self.bridge.decode(candidates)), float("nan"))
             candidates, acq_value = compute_qnehvi(
                 model, Z_train, Y_train, self.bounds, batch_size=self.batch_size,
                 avoid_points=self.Z_evaluated,
@@ -520,6 +566,9 @@ if __name__ == "__main__":
     parser.add_argument("--batch-size", type=int, default=3)
     parser.add_argument("--n-iterations", type=int, default=20)
     parser.add_argument("--mogp-iters", type=int, default=200)
+    parser.add_argument("--epsilon", type=float, default=EPSILON_GREEDY,
+                        help="epsilon-greedy wildcard probability per BO step "
+                             "(0 disables random-exploration steps)")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", default="results")
     args = parser.parse_args()
@@ -534,6 +583,7 @@ if __name__ == "__main__":
         batch_size=args.batch_size,
         n_iterations=args.n_iterations,
         mogp_train_iters=args.mogp_iters,
+        epsilon=args.epsilon,
     )
     loop.run()
 
