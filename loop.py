@@ -42,6 +42,8 @@ import os
 import sys
 import time
 import argparse
+import warnings
+import concurrent.futures
 
 import numpy as np
 import torch
@@ -89,7 +91,42 @@ from acquisition import (
     DEFAULT_OBJECTIVE_SIGNS,
 )
 import evaluation
-from docking import batch_dock_targets, docked_summary
+from docking import (
+    batch_dock_targets, docked_summary, dock_target,
+    download_protein, prepare_protein, _prepare_receptor_pdbqt,
+)
+
+
+# --- Parallel docking -------------------------------------------------------
+# Docking dominates wall-clock (~minutes per molecule for large/flexible ligands)
+# and each dock is a Vina *subprocess*, so the GIL is released while it runs —
+# a thread pool gives near-linear speedup without the pickling cost a process pool
+# would impose on the sklearn ADMET oracle and the SQLite cache. Concurrency is at
+# the MOLECULE level (each worker docks one molecule against all targets), so at
+# most `batch_size` Vina processes run at once — a sane bound on a laptop.
+DOCK_MAX_WORKERS = max(1, (os.cpu_count() or 1))
+
+
+def _prewarm_receptors(targets):
+    """Prepare each target's receptor ``.pdbqt`` ONCE, sequentially, up front.
+
+    ``dock_target`` lazily triggers ``download_protein`` / ``prepare_protein`` /
+    ``_prepare_receptor_pdbqt``, which write FIXED per-target files
+    (``<PDB>_clean.pdbqt`` …). If several worker threads hit a cold receptor cache
+    at once they would race on those writes. Doing it here — before any parallel
+    docking — removes that hazard. Idempotent and cheap once the files exist on
+    disk (the prep functions short-circuit). Returns True iff every target is ready.
+    """
+    ok = True
+    for t in targets:
+        try:
+            download_protein(t)
+            clean_pdb = prepare_protein(t)
+            _prepare_receptor_pdbqt(t, clean_pdb)
+        except Exception as exc:  # network / prep failure: fall back to sequential
+            warnings.warn(f"Receptor pre-warm failed for {t!r}: {exc}")
+            ok = False
+    return ok
 
 
 # Objective -> data-source layout, resolved once from TASK_NAMES. In the
@@ -276,11 +313,13 @@ class BOLoop:
         # --- Only survivors reach the expensive oracles ---
         if passed_local:
             passed_smiles = [smiles_list[i] for i in passed_local]
+            # ADMET is a cheap, already-batched sklearn call — leave it sequential.
             admet_df = self.oracle.predict(passed_smiles)
             admet_vals = {
                 col: admet_df[col].to_numpy(dtype=float) for _, col in self.admet_tasks
             }
-            dock_pass = batch_dock_targets(passed_smiles, self.docking_targets)
+            # Docking is the bottleneck: run the survivors in parallel.
+            dock_pass = self._dock_batch(passed_smiles)
             for k, i in enumerate(passed_local):
                 for j, col in self.admet_tasks:
                     Y[i, j] = admet_vals[col][k]
@@ -289,6 +328,44 @@ class BOLoop:
                     Y[i, j] = val
                     docking_by_target[target][i] = val
         return Y, docking_by_target, rejections
+
+    def _dock_batch(self, passed_smiles):
+        """Dock a batch of screened SMILES against every target, in PARALLEL.
+
+        Returns ``{target: np.ndarray shape (len(passed_smiles),)}`` aligned to
+        ``passed_smiles`` order (NaN on failure) — the same contract as
+        ``docking.batch_dock_targets``, which is used as the sequential fallback.
+
+        Concurrency is at the molecule level via a ``ThreadPoolExecutor`` (docking
+        is a Vina subprocess, so threads release the GIL and sidestep pickling the
+        oracle/cache). Receptors are pre-warmed first so workers never race on the
+        fixed receptor files; per-molecule ligand/pose temp files already get unique
+        names from ``tempfile`` inside ``dock_target``, so there is no file
+        collision to guard against. If pre-warm fails, or only one molecule needs
+        docking, fall back to the sequential path.
+        """
+        targets = list(self.docking_targets)
+        n = len(passed_smiles)
+        prewarmed = _prewarm_receptors(targets)
+        if not prewarmed or n <= 1:
+            return batch_dock_targets(passed_smiles, targets)
+
+        def _dock_one(smi):
+            # One worker docks a single molecule against all targets sequentially;
+            # dock_target is self-contained (unique temp files, locked SQLite cache)
+            # and returns None on failure.
+            return {t: dock_target(smi, target=t) for t in targets}
+
+        n_workers = max(1, min(n, DOCK_MAX_WORKERS))
+        with concurrent.futures.ThreadPoolExecutor(max_workers=n_workers) as executor:
+            per_mol = list(executor.map(_dock_one, passed_smiles))
+
+        dock_pass = {t: np.full(n, np.nan, dtype=np.float64) for t in targets}
+        for k, res in enumerate(per_mol):
+            for t in targets:
+                v = res[t]
+                dock_pass[t][k] = np.nan if v is None else float(v)
+        return dock_pass
 
     def _append(self, Z_new, smiles_new, Y_new):
         """Append a batch of (latent, SMILES, objective) records to loop state."""
